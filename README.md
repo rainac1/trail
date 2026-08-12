@@ -98,6 +98,10 @@ trail consists of the positions the cursor passed through during the last frame 
 render frame rate caps the trail "age", sampling rate determines path accuracy
 (`RenderOneFrame` in `src/main.cpp`).
 
+As a safety net, the window start is clamped to `now - one refresh period`, so the
+trail never stretches beyond one frame even if a frame misses its vsync (older
+samples are dropped instead of being drawn all at once).
+
 ### Pointer texture (Windows API)
 
 1. `GetCursorInfo` fetches the current cursor handle `hCursor` and visibility;
@@ -115,10 +119,15 @@ down to a few milliseconds:
 
 - **`DwmFlush` bootstrap calibration**: measures the composition refresh period and
   vsync phase (≈ 8.3 ms @ 120 Hz / 16.7 ms @ 60 Hz)
-- **vblank-front alignment**: busy-waits (tiered: sleep far / yield near / spin very
-  close) until `next_vsync - budget` before rendering, then `Present(0)` so the frame
-  lands on the *current* vsync instead of the *next* one (the old `Present(1,0)`
+- **vblank-front alignment**: sleeps (`Sleep(1)`) until ~1 ms before
+  `next_vsync - budget`, then busy-spins (`YieldProcessor`) for the final 1 ms so the
+  render thread wakes *just before* the vsync deadline, then `Present(0)` lands the
+  frame on the *current* vsync instead of the *next* one (the old `Present(1,0)`
   waited half a frame or more on average)
+- **No catch-up stall after a miss**: if rendering starts after its target vsync, the
+  loop does *not* idle-wait for the following vsync — it renders immediately and
+  re-anchors the phase, so one missed vsync doesn't stretch the next frame's interval
+  into two periods (which would otherwise pile two frames of trail into one frame)
 - **Live head point, sampled late**: `GetCursorPos` is called at the last moment —
   after the historical trail is drawn and `EndDraw`'d, just before `CopyResource` —
   and the head point is drawn in a second `BeginDraw/EndDraw` pass. Head latency ≈

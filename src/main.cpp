@@ -11,6 +11,8 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include <intrin.h>
+
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -33,16 +35,16 @@ uint64_t g_lastFrameQpc = 0;
 int g_originX = 0, g_originY = 0;  // 虚拟屏幕原点（窗口左上角）
 bool g_hideCursor = false;
 HANDLE g_samplerThread = nullptr;
-
 // ---- 低延迟渲染：vblank 前对齐（Present(0) 赶上当前 vsync 显示）----
 struct VsyncState {
-  bool ok = false;        // 校准成功（否则回退 Present(1,0)）
   uint64_t period = 0;    // 合成刷新周期（QPC ticks）
   uint64_t anchor = 0;    // 目标 vsync 相位（QPC 域）
   double emaRenderMs = 3.0;  // 渲染耗时 EMA，用于自适应预算
   uint64_t frameCount = 0;
   uint64_t missed = 0;    // 渲染超时错过目标 vsync 的次数
 };
+// 主线程独占的 vsync 校准/对齐状态（含刷新周期，供 RenderOneFrame 做窗口裁剪）。
+static VsyncState g_vsync;
 
 static uint64_t QpcNow() {
   LARGE_INTEGER t;
@@ -70,7 +72,6 @@ static bool CalibrateVsync(VsyncState& s) {
   if (ms < 3.0 || ms > 70.0) return false;  // 刷新率约 15Hz~333Hz 之外视为异常
   s.period = period;
   s.anchor = t1;  // 最近一次合成刷新 ≈ vsync 相位
-  s.ok = true;
   DiagLog(L"[vsync] calibrated refresh period: %.2f ms", ms);
   return true;
 }
@@ -107,38 +108,45 @@ static void RefreshVsyncPeriod(VsyncState& s) {
 }
 
 // 忙等（分层等待）到 下一 vsync - budgetMs，返回时渲染可赶上当前 vsync。
-// 分层：剩余 >2/3 预算睡眠；剩余 >0.1ms 让出时间片；极近则纯忙等，
-// 避免 Sleep(1) 睡过头的过冲导致错过 vblank。
-static void WaitForVsyncAligned(VsyncState& s, double budgetMs) {
+// 返回 true 表示起步时已错过目标 vsync（上一帧渲染超时，或首帧），本帧不等待、
+// 立即渲染追赶。唤醒分两段：远离 target 用 Sleep(1) 粗睡省 CPU，进入最后 1ms
+// 纯忙等（YieldProcessor）精确对齐到 target，吸收 Sleep(1) 的过冲，保证唤醒点
+// 稳定略早于 vsync 而不睡过头。
+static bool WaitForVsyncAligned(VsyncState& s, double budgetMs) {
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
   const uint64_t budget =
       static_cast<uint64_t>(budgetMs * static_cast<double>(freq.QuadPart) / 1000.0);
   const uint64_t now = QpcNow();
-  // 本帧内容将在"下一个 vsync"显示：
-  //  - 锚点已过（上一帧超时）：推进到未来最近的同相位 vsync；
-  //  - 锚点未到（上一帧提前完成）：本帧只能排到 anchor + period（DWM 一帧
-  //    占一个 vsync 槽），若复用当前 anchor 会导致渲染逐帧逼近 vsync 直至错过。
-  uint64_t next;
+
+  // 已错过目标 vsync：不空等、立即渲染追赶，避免空等把"漏一帧"放大成
+  // "帧间隔翻倍"——否则下一帧的尾迹窗口 [T_prev, T_now) 会跨越两个刷新周期，
+  // 出现"一帧渲染两帧轨迹"的积压。仍把相位推进到未来最近的同相位 vsync，
+  // 供下一帧重新对齐节奏。
   if (now >= s.anchor) {
-    next = s.anchor + s.period * ((now - s.anchor) / s.period + 1);
-  } else {
-    next = s.anchor + s.period;
+    s.anchor = s.anchor + s.period * ((now - s.anchor) / s.period + 1);
+    return true;
   }
-  s.anchor = next;
-  const uint64_t target = next - budget;
-  const uint64_t spinThreshold = static_cast<uint64_t>(0.1 * static_cast<double>(freq.QuadPart) / 1000.0);
+
+  // 锚点未到（上一帧提前完成）：本帧只能排到 anchor + period（DWM 一帧
+  // 占一个 vsync 槽），若复用当前 anchor 会导致渲染逐帧逼近 vsync 直至错过。
+  s.anchor = s.anchor + s.period;
+  const uint64_t target = s.anchor - budget;
+  // 纯忙等缓冲区：足够吸收 Sleep(1) 在 timeBeginPeriod(1) 下的过冲（约 ≤0.5ms），
+  // 使唤醒点精确落在 target（= vsync - budget）上，稳定略早于 vsync 而不睡过头。
+  const uint64_t spinMargin =
+      static_cast<uint64_t>(1.0 * static_cast<double>(freq.QuadPart) / 1000.0);
   for (;;) {
     const uint64_t t = QpcNow();
     if (t >= target) break;
     const uint64_t remain = target - t;
-    if (remain > (budget * 2) / 3) {
-      Sleep(1);
-    } else if (remain > spinThreshold) {
-      Sleep(0);
+    if (remain > spinMargin) {
+      Sleep(1);  // 还远：粗睡省 CPU
+    } else {
+      YieldProcessor();  // 最后 1ms：纯忙等，降低自旋功耗与总线争用
     }
-    // 剩余 <=0.1ms：直接忙等（循环继续）
   }
+  return false;
 }
 
 void PrintUsage() {
@@ -179,7 +187,13 @@ void RenderOneFrame(bool waitForVBlank) {
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
   const uint64_t nowQ = static_cast<uint64_t>(now.QuadPart);
-  const uint64_t windowStart = g_lastFrameQpc;  // 上帧时刻 T_prev
+  // 尾迹窗口起点默认取上帧时刻 T_prev。若本帧与上一帧间隔超过一个刷新周期
+  // （漏帧），把起点前移到"最近一个刷新周期"，避免一次性画出两帧的轨迹。
+  uint64_t windowStart = g_lastFrameQpc;  // 上帧时刻 T_prev
+  if (g_vsync.period > 0 && nowQ > g_vsync.period) {
+    const uint64_t cutoff = nowQ - g_vsync.period;
+    if (windowStart < cutoff) windowStart = cutoff;
+  }
 
   // 消费自上次以来的新增采样点，只保留落在 [T_prev, T_now) 内的。
   Sample pts[512];
@@ -323,8 +337,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   // 默认模式：DwmFlush 校准 vsync 相位，忙等到 vblank 前 budget 毫秒开始渲染，
   // Present(0) 让帧赶上当前 vsync 显示 —— 尾迹头延迟从约 1 帧压缩到渲染预算量级。
   // 校准失败（无 DWM 合成）时回退 Present(1,0) 阻塞等 vsync。
-  VsyncState vsync;
-  const bool lowLatency = CalibrateVsync(vsync);
+  const bool lowLatency = CalibrateVsync(g_vsync);
   if (!lowLatency) DiagLog(L"[main] vsync calibration failed, falling back to Present(1,0)");
   double budgetMs = 2.0;
   LARGE_INTEGER freq;
@@ -346,7 +359,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     if (!running) break;
 
     if (lowLatency) {
-      WaitForVsyncAligned(vsync, budgetMs);
+      const bool startedLate = WaitForVsyncAligned(g_vsync, budgetMs);
       const uint64_t t0 = QpcNow();
       RenderOneFrame(false);
       const uint64_t t1 = QpcNow();
@@ -355,26 +368,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
       // vsync 导致对齐失效），并限幅 [1, 8]ms。
       const double renderMs =
           static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(freq.QuadPart);
-      vsync.emaRenderMs = vsync.emaRenderMs * 0.9 + renderMs * 0.1;
+      g_vsync.emaRenderMs = g_vsync.emaRenderMs * 0.9 + renderMs * 0.1;
       const double periodMs =
-          static_cast<double>(vsync.period) * 1000.0 / static_cast<double>(freq.QuadPart);
+          static_cast<double>(g_vsync.period) * 1000.0 / static_cast<double>(freq.QuadPart);
       // 自适应预算：EMA + 1.0ms 余量，限幅 [1, 8]ms（配合脏矩形清除与延迟采样，
       // 渲染更快，故下限/余量较旧值收紧，让 Present 更贴近 vsync）。
-      budgetMs = vsync.emaRenderMs + 1.0;
+      budgetMs = g_vsync.emaRenderMs + 1.0;
       if (budgetMs < 1.0) budgetMs = 1.0;
       if (budgetMs > 8.0) budgetMs = 8.0;
       const double budgetMax = periodMs * 0.6;
       if (budgetMs > budgetMax) budgetMs = budgetMax;
-      ++vsync.frameCount;
-      if (t1 > vsync.anchor) ++vsync.missed;  // 渲染在目标 vsync 后才完成 -> 错过
-      if (vsync.frameCount % 3000 == 0) {
+      ++g_vsync.frameCount;
+      // 错过：起步就晚（startedLate），或渲染在目标 vsync 后才完成（t1 > anchor）。
+      if (startedLate || t1 > g_vsync.anchor) ++g_vsync.missed;
+      if (g_vsync.frameCount % 3000 == 0) {
         DiagLog(L"[vsync] frames=%llu missed=%llu (%.1f%%), render EMA=%.2f ms, budget=%.2f ms",
-                static_cast<unsigned long long>(vsync.frameCount),
-                static_cast<unsigned long long>(vsync.missed),
-                100.0 * static_cast<double>(vsync.missed) / vsync.frameCount,
-                vsync.emaRenderMs, budgetMs);
+                static_cast<unsigned long long>(g_vsync.frameCount),
+                static_cast<unsigned long long>(g_vsync.missed),
+                100.0 * static_cast<double>(g_vsync.missed) / g_vsync.frameCount,
+                g_vsync.emaRenderMs, budgetMs);
       }
-      if (vsync.frameCount % 1500 == 0) RefreshVsyncPeriod(vsync);
+      if (g_vsync.frameCount % 1500 == 0) RefreshVsyncPeriod(g_vsync);
     } else {
       RenderOneFrame(true);  // Present(1,0)，vsync 阻塞节流
     }
