@@ -1,37 +1,41 @@
-# Subframe Cursor Trail Overlay
+# Trail
 
-Windows 全屏透明叠加层：用 C++ + Direct2D 绘制**帧内鼠标尾迹** —— 取过去一帧时间内
-鼠标的所有采样点，在下一帧把指针纹理绘制到对应位置。每个采样点恰好显示一帧后消失，
-尾迹长度 ≈ 一帧内的鼠标位移。
+A Windows full-screen transparent overlay that renders a **sub-frame cursor trail**
+with C++ + Direct2D: it captures every cursor sample within the past frame and draws
+the pointer texture at each position on the next frame. Each sample is shown for
+exactly one frame before disappearing, so the trail length ≈ the cursor's movement
+over one frame.
 
-## 构建
+## Building
 
-### 前置条件
+### Prerequisites
 
-- Windows 10/11（需启用桌面合成 DWM）
-- **Visual Studio 2017+**：安装"使用 C++ 的桌面开发"工作负载（含 MSVC 编译器、Windows SDK、Ninja）
-- **CMake 3.16+**（加入 PATH；https://cmake.org 或 `winget install cmake`）
-- Ninja 可选（VS2019+ 自带；无 Ninja 时脚本自动回退 MSBuild）
+- Windows 10/11 (desktop composition / DWM must be enabled)
+- **Visual Studio 2017+** with the "Desktop development with C++" workload
+  (MSVC compiler, Windows SDK, Ninja)
+- **CMake 3.16+** on `PATH` (https://cmake.org or `winget install cmake`)
+- Ninja is optional (bundled with VS2019+; the script falls back to MSBuild)
 
-### 方式一：build.bat（推荐）
+### Option 1: build.bat (recommended)
 
 ```bat
-build.bat            # Release 构建
-build.bat Debug      # Debug 构建
+build.bat            # Release build
+build.bat Debug      # Debug build
 ```
 
-脚本流程：`vswhere` 自动定位 VS → 调用 `vcvarsall.bat x64` 设置编译环境 →
-优先用 Ninja 生成器（找不到则回退 Visual Studio/MSBuild 生成器）→ 编译。
-产物路径：
+The script locates Visual Studio via `vswhere`, sets up the environment with
+`vcvarsall.bat x64`, prefers the Ninja generator (falls back to Visual Studio /
+MSBuild), then compiles. Output paths:
 
-| 生成器 | 输出 |
+| Generator | Output |
 |---|---|
-| Ninja | `build\subframe_cursor_trail.exe` |
-| Visual Studio (MSBuild) | `build\Release\subframe_cursor_trail.exe`（或 `build\Debug\...`） |
+| Ninja | `build\trail.exe` |
+| Visual Studio (MSBuild) | `build\Release\trail.exe` (or `build\Debug\...`) |
 
-### 方式二：手动命令（cmd，Ninja）
+### Option 2: manual (cmd, Ninja)
 
-Visual Studio 安装路径按实际情况修改（可用 `vswhere -latest -property installationPath` 查询）：
+Adjust the Visual Studio path to match your install (query it with
+`vswhere -latest -property installationPath`):
 
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
@@ -39,110 +43,144 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-### 方式三：手动命令（cmd，MSBuild，无需 Ninja/vcvarsall）
+### Option 3: manual (cmd, MSBuild, no Ninja/vcvarsall)
 
 ```bat
-cmake -S . -B build        REM 生成 Visual Studio 工程（多配置）
+cmake -S . -B build        REM generates a Visual Studio project (multi-config)
 cmake --build build --config Release
 ```
 
-### 常见问题
+### Troubleshooting
 
-- **`[ERROR] Visual Studio C++ toolchain not found`**：未安装 VS 或缺少 C++ 工作负载，
-  打开 Visual Studio Installer 勾选"使用 C++ 的桌面开发"后重试。
-- **`cmake 不是内部或外部命令`**：未安装 CMake 或未加入 PATH。
-- **编译报找不到 `d2d1.h` / `d3d11.h` / `dcomp.h`**：必须在 vcvarsall x64（或 VS
-  开发者命令提示符）环境中编译；直接双击 build.bat 也会自动配置该环境。
-- **`The build directory is incompatible with the generator`**：`build/` 之前用别的
-  生成器配置过，删除 `build/` 目录后重新构建。
-- 构建/运行问题可查看 exe 同目录的 `subframe_cursor_trail.log`（见"已知限制"）。
+- **`[ERROR] Visual Studio C++ toolchain not found`**: Visual Studio or the C++
+  workload is missing. Open the Visual Studio Installer, add "Desktop development
+  with C++", and retry.
+- **`cmake is not recognized`**: CMake is not installed or not on `PATH`.
+- **Build errors for `d2d1.h` / `d3d11.h` / `dcomp.h`**: build from the `vcvarsall x64`
+  (or VS Developer Command Prompt) environment; `build.bat` does this automatically.
+- **`The build directory is incompatible with the generator`**: `build/` was
+  configured with a different generator before — delete `build/` and rebuild.
+- Build/runtime issues are logged to `trail.log` next to the exe (see "Known
+  limitations").
 
-## 运行
+## Running
 
 ```bat
-build\subframe_cursor_trail.exe                # 默认 1000Hz 采样
-build\subframe_cursor_trail.exe --sample-ms 2  # 500Hz 采样（省 CPU）
-build\subframe_cursor_trail.exe --hide-cursor  # 顺带隐藏系统光标（仅覆盖窗口内）
+build\trail.exe                # default 1000 Hz sampling
+build\trail.exe --sample-ms 2  # 500 Hz sampling (lower CPU)
+build\trail.exe --hide-cursor  # also hide the system cursor (inside the overlay)
 ```
 
-- **退出**：`Ctrl+Alt+Q`
-- 窗口覆盖整个虚拟桌面（多显示器），点击穿透，不抢焦点。
+- **Quit**: `Ctrl+Alt+Q`
+- The window covers the entire virtual desktop (multi-monitor), is click-through,
+  and never steals focus.
 
-## 工作原理
+## How it works
 
-### 线程模型（两个线程）
+### Thread model (two threads)
 
-| 线程 | 职责 |
+| Thread | Responsibility |
 |---|---|
-| 主线程 | 创建窗口、消息循环、渲染。`Present(1, 0)` 阻塞到 vsync，空闲时几乎不占 CPU |
-| 采样线程 | `THREAD_PRIORITY_HIGHEST`，按 `--sample-ms`（默认 1ms ≈ 1000Hz）轮询 `GetCursorPos`，把 `(QPC 时间戳, x, y)` 推入无锁 SPSC 环形缓冲 |
+| Main thread | Creates the window, runs the message loop, renders. `Present(1, 0)` blocks on vsync; nearly zero CPU when idle. |
+| Sampler thread | `THREAD_PRIORITY_HIGHEST`; polls `GetCursorPos` every `--sample-ms` (default 1 ms ≈ 1000 Hz) and pushes `(QPC timestamp, x, y)` into a lock-free SPSC ring buffer. |
 
-采样线程与渲染线程之间用**无锁单生产者/单消费者环形缓冲**（`src/ring_buffer.h`）同步，
-通过 release/acquire 原子配对保证可见性，全程无锁、无动态分配。
+The sampler and render threads synchronize through a **lock-free single-producer /
+single-consumer ring buffer** (`src/ring_buffer.h`) using release/acquire atomic
+pairs for visibility — no locks, no dynamic allocation on the hot path.
 
-### 帧内尾迹语义
+### Sub-frame trail semantics
 
-渲染线程记录上一帧时刻 `T_prev`，每帧只绘制 `t ∈ [T_prev, T_now)` 内的采样点。
-由于帧窗口无缝连续覆盖整个时间线，**每个采样点恰好被绘制一帧**：最新采样点在采样后
-的下一帧出现，随后滑出窗口消失。尾迹由最近一帧时间内鼠标经过的位置组成，且渲染帧率
-决定尾迹"年龄"上限、采样率决定路径的精确度（`src/main.cpp` 的 `RenderOneFrame`）。
+The render thread records the previous frame's timestamp `T_prev`, and each frame
+draws only the samples in `t ∈ [T_prev, T_now)`. Because the frame windows tile the
+timeline seamlessly, **each sample is drawn exactly once**: the newest sample appears
+on the frame after it was sampled, then slides out of the window and disappears. The
+trail consists of the positions the cursor passed through during the last frame —
+render frame rate caps the trail "age", sampling rate determines path accuracy
+(`RenderOneFrame` in `src/main.cpp`).
 
-### 指针纹理（Windows API）
+### Pointer texture (Windows API)
 
-1. `GetCursorInfo` 取当前光标句柄 `hCursor` 与显示状态；
-2. `CopyIcon` + `GetIconInfo` 取得光标位图与热点；
-3. `GetDIBits` 读出 32bpp BGRA 像素，做 alpha 预乘；
-4. 以 `hCursor` 为 key 缓存为 `ID2D1Bitmap`（premultiplied），**句柄不变则每帧零开销**
-   （每帧仅一次 `GetCursorInfo`，约 1µs）。动画光标取当前帧，旧式 mask-only 光标走
-   AND/XOR 合成 fallback。
+1. `GetCursorInfo` fetches the current cursor handle `hCursor` and visibility;
+2. `CopyIcon` + `GetIconInfo` yield the cursor bitmap and hotspot;
+3. `GetDIBits` reads 32 bpp BGRA pixels, which are alpha-premultiplied;
+4. cached as an `ID2D1Bitmap` (premultiplied) keyed by `hCursor` — **zero per-frame
+   cost while the handle is unchanged** (one `GetCursorInfo` per frame, ≈ 1 µs).
+   Animated cursors grab the current frame; legacy mask-only cursors fall back to
+   AND/XOR compositing.
 
-### 低延迟渲染（vblank 前对齐）
+### Low-latency rendering (vblank-front alignment)
 
-默认启用，将尾迹与系统光标的延迟从约 1 帧压缩到数毫秒：
+Enabled by default; compresses the head-vs-system-cursor latency from about one frame
+down to a few milliseconds:
 
-- **`DwmFlush` 自举校准**：实测合成刷新周期与 vsync 相位（约 8.3ms@120Hz / 16.7ms@60Hz）
-- **vblank 前对齐**：忙等（分层等待：远睡/近让出/极近忙等）到 `next_vsync - budget` 再渲染，
-  `Present(0)` 让帧赶上*当前* vsync 显示，而不是等*下一个*（原来 `Present(1,0)` 平均多等半帧以上）
-- **实时头部点**：渲染提交前最后一刻 `GetCursorPos` 注入尾迹头，头部延迟 ≈ 渲染预算（2-3ms）
-- **自适应预算**：渲染耗时 EMA + 1.5ms 余量，限幅 [2, 8]ms，渲染快时自动收紧
-- 校准失败（无 DWM 合成）时自动回退 `Present(1,0)`；运行日志每 300 帧输出
-  `missed`（渲染超时错过 vsync 的帧占比，实测约 0.2%）与预算统计
+- **`DwmFlush` bootstrap calibration**: measures the composition refresh period and
+  vsync phase (≈ 8.3 ms @ 120 Hz / 16.7 ms @ 60 Hz)
+- **vblank-front alignment**: busy-waits (tiered: sleep far / yield near / spin very
+  close) until `next_vsync - budget` before rendering, then `Present(0)` so the frame
+  lands on the *current* vsync instead of the *next* one (the old `Present(1,0)`
+  waited half a frame or more on average)
+- **Live head point, sampled late**: `GetCursorPos` is called at the last moment —
+  after the historical trail is drawn and `EndDraw`'d, just before `CopyResource` —
+  and the head point is drawn in a second `BeginDraw/EndDraw` pass. Head latency ≈
+  the render budget (copy + present), not the whole draw
+- **Adaptive budget**: render-time EMA + 1.0 ms margin, clamped to [1, 8] ms,
+  tightening automatically when rendering is fast
+- On calibration failure (no DWM composition) it falls back to `Present(1,0)`; the
+  log prints `missed` (fraction of frames whose render overran the target vsync,
+  ~0.2 % measured) and budget stats every 3000 frames
+- `IDXGISwapChain2::SetMaximumFrameLatency(1)` caps the DWM composition queue depth
 
-### 透明渲染（DirectComposition + 硬件 GPU 单路径）
+### Transparent rendering (DirectComposition + hardware GPU single path)
 
-- D2D 渲染到自建 premultiplied 离屏位图 → 每帧 GPU `CopyResource` 拷贝到 flip-model
-  composition swapchain → `IDCompositionVisual::SetContent` 由 DWM 按 premultiplied alpha
-  合成，`Present(1,0)` vsync 节流
-- 窗口样式：`WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED`，
-  并调用 `SetLayeredWindowAttributes(alpha=255)`
-- **点击穿透**：`WS_EX_LAYERED | WS_EX_TRANSPARENT` 组合使整个窗口对鼠标命中测试透明
-  （微软 window-features 文档：layered 窗口命中基于形状/透明度，加 `WS_EX_TRANSPARENT`
-  后形状被忽略、鼠标事件传给下层窗口；DComp 允许 layered target 窗口）。注意
-  `WM_NCHITTEST → HTTRANSPARENT` 只转发给同线程窗口、`WS_EX_TRANSPARENT` 单独使用对
-  命中无效——两者都不是跨进程穿透的正确机制
-- 仅使用硬件 D3D11 设备，**不做 WARP 软件降级**：初始化失败时弹窗报错并写日志
-- 为什么用 DirectComposition 而非 flip+Hwnd：部分显示栈（实测 AMD Radeon 780M 核显）
-  对 `CreateSwapChainForHwnd`/`CreateBitmapFromDxgiSurface` + premultiplied alpha 返回
-  `DXGI_ERROR_INVALID_CALL`/`E_INVALIDARG`，而 `CreateSwapChainForComposition` +
-  离屏 blit 完整可用，是该场景下唯一可靠的硬件透明路径
-- 每帧 `Clear` 为全透明后逐个 `DrawBitmap`（`NEAREST_NEIGHBOR` 插值，1:1 锐利且开销最低）
+- D2D renders into a self-owned premultiplied offscreen bitmap → per-frame GPU
+  `CopyResource` into a flip-model composition swapchain → `IDCompositionVisual::SetContent`
+  composites it in DWM with premultiplied alpha, throttled by vsync
+- Offscreen bitmap content persists across frames, so each frame **clears only the
+  bounding box of the previous frame's trail** (dirty-rect clear) instead of a full-
+  screen clear — a large GPU saving at high resolutions
+- Window styles: `WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+  | WS_EX_LAYERED`, plus `SetLayeredWindowAttributes(alpha=255)`
+- **Click-through**: `WS_EX_LAYERED | WS_EX_TRANSPARENT` makes the whole window
+  transparent to mouse hit-testing (per Microsoft's window-features docs: layered
+  window hit-testing is shape/alpha based, and `WS_EX_TRANSPARENT` then ignores the
+  shape and forwards mouse events to windows below; DComp permits a layered target
+  window). Note that `WM_NCHITTEST → HTTRANSPARENT` only forwards to same-thread
+  sibling windows, and `WS_EX_TRANSPARENT` alone has no hit-test effect — neither is
+  a correct cross-process click-through mechanism
+- Hardware D3D11 device only, **no WARP software fallback**: on failure it shows an
+  error and writes to the log
+- Why DirectComposition instead of flip+Hwnd: some display stacks (e.g. AMD Radeon
+  780M iGPU) return `DXGI_ERROR_INVALID_CALL`/`E_INVALIDARG` from
+  `CreateSwapChainForHwnd`/`CreateBitmapFromDxgiSurface` with premultiplied alpha,
+  whereas `CreateSwapChainForComposition` + offscreen blit works everywhere and is
+  the only reliable hardware transparent path in this scenario
+- Every frame clears to transparent (dirty-rect) and draws each sample with
+  `DrawBitmap` (`NEAREST_NEIGHBOR` — 1:1 sharp and cheapest)
 
-## 性能设计要点
+## Performance notes
 
-- 渲染热路径零分配：采样点收集用栈上定长数组，光标纹理仅在形状变化时抓取一次；
-- 无锁 SPSC 环形缓冲：`Capacity = 4096`，1000Hz 下可容忍约 4 秒渲染卡顿而不丢序；
-- 采样线程 `timeBeginPeriod(1)` 提升定时器精度；高优先级但非 `TIME_CRITICAL`，
-  避免抢占 DWM / 游戏线程；
-- 主循环由 vsync 自然节流，空闲 CPU 占用极低。
+- Zero-allocation render hot path: samples are collected into a fixed stack array,
+  and the cursor texture is captured only when its shape changes
+- Lock-free SPSC ring buffer: `Capacity = 4096`, tolerating ~4 s of render stall at
+  1000 Hz without dropping order
+- Sampler thread uses `timeBeginPeriod(1)` for timer precision; high priority but not
+  `TIME_CRITICAL`, to avoid preempting DWM / game threads
+- The main loop is naturally throttled by vsync; idle CPU usage is very low
 
-## 已知限制
+## Known limitations
 
-- 未处理 D3D 设备丢失（`D2DERR_RECREATE_TARGET` 时直接跳过，罕见场景）；
-- 多显示器且各屏 DPI 不同时，跨屏窗口存在 DWM 缩放，尾迹坐标可能偏移，推荐单 DPI 环境；
-- `--hide-cursor` 仅在覆盖窗口内隐藏光标（窗口覆盖整个桌面，等效全局）；
-- 光标句柄被系统复用（形状相同）时缓存直接命中，纹理依然正确；
-- 需要支持 D3D11 硬件加速的 GPU 及启用的桌面合成（DWM）：无硬件设备时程序拒绝启动（不降级 WARP）；
-- 初始化失败时通过 MessageBox 与 exe 同目录的 `subframe_cursor_trail.log` 输出具体失败步骤与
-  HRESULT（环境变量 `SUBFRAME_NO_UI=1` 可禁用弹窗）；
-- 尾迹头与系统光标仍有约一个渲染预算（2-3ms）的固有差距（采样→DWM 合成物理下限），
-  以及采样线程的量化误差（默认 1ms）。
+- D3D device loss is not handled (`D2DERR_RECREATE_TARGET` is skipped; rare)
+- With mixed-DPI multi-monitor setups the cross-screen window is scaled by DWM and
+  trail coordinates can be offset; single-DPI is recommended
+- `--hide-cursor` hides the cursor only inside the overlay (which covers the whole
+  desktop, so effectively global)
+- When a cursor handle is reused by the system (same shape), the cache hits and the
+  texture stays correct
+- Requires a D3D11-hardware-accelerated GPU and enabled desktop composition (DWM);
+  the program refuses to start without a hardware device (no WARP downgrade)
+- On initialization failure, a `MessageBox` and `trail.log` (next to the exe) show the
+  failing step and HRESULT; set `TRAIL_NO_UI=1` to suppress the dialog (the legacy
+  `SUBFRAME_NO_UI` name is still accepted)
+- The trail head still lags the system cursor by roughly one render budget (a few
+  milliseconds — the physical floor of sample → DWM composite), plus the sampler
+  thread's quantization (1 ms by default)

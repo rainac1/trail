@@ -18,7 +18,7 @@ static void OpenLog() {
   if (n == 0 || n >= MAX_PATH) return;
   wchar_t* slash = wcsrchr(g_logPath, L'\\');
   if (slash) wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - g_logPath),
-                      L"subframe_cursor_trail.log");
+                      L"trail.log");
   _wfopen_s(&g_log, g_logPath, L"a, ccs=UTF-8");
   if (g_log) {
     fwprintf(g_log, L"\n===== %ls =====\n", L"--- session ---");
@@ -30,7 +30,9 @@ void DiagInit() {
   OpenLog();
   // 仅当变量值为 "1" 时才禁用弹窗（避免 "0"/"false" 误触发）。
   wchar_t buf[2] = {};
-  g_noUi = GetEnvironmentVariableW(L"SUBFRAME_NO_UI", buf, 2) > 0 && buf[0] == L'1';
+  // TRAIL_NO_UI=1 禁用弹窗；旧名 SUBFRAME_NO_UI 仍兼容（项目重命名前遗留）。
+  g_noUi = (GetEnvironmentVariableW(L"TRAIL_NO_UI", buf, 2) > 0 && buf[0] == L'1') ||
+           (GetEnvironmentVariableW(L"SUBFRAME_NO_UI", buf, 2) > 0 && buf[0] == L'1');
 }
 
 void DiagLog(const wchar_t* fmt, ...) {

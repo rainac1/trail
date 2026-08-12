@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 REM ============================================================
-REM  SubframeCursorTrailOverlay build script
+REM  Trail build script
 REM  Usage: build.bat [Debug|Release]     (default: Release)
 REM ============================================================
 
@@ -74,9 +74,9 @@ cmake --build build --config %BUILD_TYPE%
 if errorlevel 1 exit /b 1
 
 if "%USING_NINJA%"=="1" (
-  set "OUT_EXE=build\subframe_cursor_trail.exe"
+  set "OUT_EXE=build\trail.exe"
 ) else (
-  set "OUT_EXE=build\%BUILD_TYPE%\subframe_cursor_trail.exe"
+  set "OUT_EXE=build\%BUILD_TYPE%\trail.exe"
 )
 echo.
 echo Build OK: %OUT_EXE%

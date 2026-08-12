@@ -1,5 +1,6 @@
 #include "overlay_renderer.h"
 
+#include <cfloat>
 #include <cstdio>
 #include <vector>
 
@@ -117,6 +118,11 @@ bool OverlayRenderer::Initialize(HWND hwnd, int width, int height) {
     LogHr(L"CreateSwapChainForComposition", hr);
     return false;
   }
+  // 限制 DWM 合成队列深度为 1：避免极端情况下 Present(0) 提交的帧在合成队列中
+  // 堆积，导致 DWM 显示的是较旧的帧。对 composition swapchain 是最低成本的保险
+  // （不支持时静默忽略）。
+  Microsoft::WRL::ComPtr<IDXGISwapChain2> sc2;
+  if (SUCCEEDED(swapChain_.As(&sc2))) sc2->SetMaximumFrameLatency(1);
 
   // D2D 渲染目标：自建 premultiplied 离屏位图（不直接绑定 swapchain backbuffer，
   // 该显示栈对 CreateBitmapFromDxgiSurface + flip backbuffer 一律 E_INVALIDARG）。
@@ -176,27 +182,65 @@ void OverlayRenderer::Shutdown() {
 
 bool OverlayRenderer::RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY,
                                   const Sample* samples, uint32_t count, int originX, int originY,
-                                  bool waitForVBlank) {
+                                  bool waitForVBlank, bool drawLiveHead) {
   if (!ctx_) return false;
 
-  ctx_->BeginDraw();
-  ctx_->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));  // 全透明
+  const D2D1_RECT_F src{0.0f, 0.0f, static_cast<FLOAT>(texW), static_cast<FLOAT>(texH)};
+  // 屏幕坐标 -> 窗口客户区坐标（窗口左上角 = 虚拟屏幕原点）。
+  const auto dstFor = [&](int x, int y) {
+    const FLOAT left = static_cast<FLOAT>(x - hotX - originX);
+    const FLOAT top = static_cast<FLOAT>(y - hotY - originY);
+    return D2D1_RECT_F{left, top, left + static_cast<FLOAT>(texW), top + static_cast<FLOAT>(texH)};
+  };
 
-  if (cursorBmp && count > 0) {
-    const D2D1_RECT_F src{0.0f, 0.0f, static_cast<FLOAT>(texW), static_cast<FLOAT>(texH)};
+  // 本帧绘制内容 bbox（用于下一帧脏矩形清除）。
+  D2D1_RECT_F curBox{FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
+  const auto extend = [&](const D2D1_RECT_F& r) {
+    if (r.left < curBox.left) curBox.left = r.left;
+    if (r.top < curBox.top) curBox.top = r.top;
+    if (r.right > curBox.right) curBox.right = r.right;
+    if (r.bottom > curBox.bottom) curBox.bottom = r.bottom;
+  };
+
+  // ---- pass 1：清除上一帧残留 + 绘制历史尾迹 ----
+  ctx_->BeginDraw();
+  if (hasLastFrameBox_) {
+    // 只清除上一帧绘制内容覆盖的区域，替代全屏 Clear（高分辨率下大幅降低开销）。
+    ctx_->PushAxisAlignedClip(lastFrameBox_, D2D1_ANTIALIAS_MODE_ALIASED);
+    ctx_->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+    ctx_->PopAxisAlignedClip();
+  }
+  if (cursorBmp) {
     for (uint32_t i = 0; i < count; ++i) {
-      const Sample& s = samples[i];
-      // 屏幕坐标 -> 窗口客户区坐标（窗口左上角 = 虚拟屏幕原点）。
-      const FLOAT left = static_cast<FLOAT>(s.x - hotX - originX);
-      const FLOAT top = static_cast<FLOAT>(s.y - hotY - originY);
-      const D2D1_RECT_F dst{left, top, left + texW, top + texH};
+      const D2D1_RECT_F dst = dstFor(samples[i].x, samples[i].y);
       // NEAREST_NEIGHBOR：光标像素 1:1 锐利，且是开销最低的插值模式。
       ctx_->DrawBitmap(cursorBmp, dst, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
+      extend(dst);
+    }
+  }
+  HRESULT hr = ctx_->EndDraw();
+  if (hr == D2DERR_RECREATE_TARGET) return false;  // 设备丢失（未做重建，见 README）
+
+  // ---- pass 2：实时头部点（提交前最后一刻采样，最小化头部延迟）----
+  if (drawLiveHead && cursorBmp) {
+    POINT pt;
+    if (GetCursorPos(&pt)) {
+      const D2D1_RECT_F dst = dstFor(pt.x, pt.y);
+      ctx_->BeginDraw();
+      ctx_->DrawBitmap(cursorBmp, dst, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
+      hr = ctx_->EndDraw();
+      if (hr == D2DERR_RECREATE_TARGET) return false;
+      extend(dst);
     }
   }
 
-  const HRESULT hr = ctx_->EndDraw();
-  if (hr == D2DERR_RECREATE_TARGET) return false;  // 设备丢失（未做重建，见 README）
+  // 记录本帧 bbox 供下一帧清除（本帧无内容则下一帧无需清除）。
+  if (curBox.left <= curBox.right && curBox.top <= curBox.bottom) {
+    lastFrameBox_ = curBox;
+    hasLastFrameBox_ = true;
+  } else {
+    hasLastFrameBox_ = false;
+  }
 
   // 离屏渲染结果 -> 当前 swapchain backbuffer（GPU 显存拷贝），再 Present。
   // FLIP_SEQUENTIAL 每帧轮换 buffer，故必须每帧重新 GetBuffer(0)。

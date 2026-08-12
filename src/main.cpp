@@ -143,8 +143,8 @@ static void WaitForVsyncAligned(VsyncState& s, double budgetMs) {
 
 void PrintUsage() {
   wprintf(
-      L"SubframeCursorTrailOverlay\n"
-      L"Usage: subframe_cursor_trail.exe [options]\n"
+      L"Trail\n"
+      L"Usage: trail.exe [options]\n"
       L"  --sample-ms <N>   sample interval in ms, default 1 (~1000 Hz)\n"
       L"  --hide-cursor     hide the system cursor (within this overlay window)\n"
       L"  --help            show this help\n"
@@ -193,13 +193,9 @@ void RenderOneFrame(bool waitForVBlank) {
   }
   g_consumerIndex.store(head, std::memory_order_relaxed);
 
-  // 实时头部点：渲染提交前的最后一刻直接采样光标位置并作为尾迹头。
-  // 它贴近"屏幕显示时刻"的光标，把头部延迟从约 1 帧（vsync 等待）压缩到
-  // 渲染预算量级（数毫秒）。该点每帧都出现（跟随光标），与只出现一次的
-  // 历史采样点不同——正是尾迹的"头"。
-  POINT livePt;
-  GetCursorPos(&livePt);
-  if (n < 512) pts[n++] = Sample{nowQ, livePt.x, livePt.y};
+  // 实时头部点改为在 RenderFrame 内部、历史点 EndDraw 之后（CopyResource 之前）
+  // 延迟采样，见 overlay_renderer.cpp —— 把头部点采样从渲染管线最前端推迟到
+  // 提交前最后一刻，头部延迟从约一个渲染预算压缩到 CopyResource+Present 量级。
 
   // 光标纹理：仅当 hCursor 句柄变化时才重新抓取（游戏中光标形状几乎不变，
   // 该路径每帧仅一次 GetCursorInfo，开销约 1µs）。
@@ -223,7 +219,7 @@ void RenderOneFrame(bool waitForVBlank) {
   }
 
   g_renderer.RenderFrame(cursorBmp, texW, texH, hotX, hotY, pts, n, g_originX, g_originY,
-                         waitForVBlank);
+                         waitForVBlank, /*drawLiveHead=*/true);
   g_lastFrameQpc = nowQ;
 }
 
@@ -270,12 +266,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   wc.lpfnWndProc = WndProc;
   wc.hInstance = hInstance;
   wc.hCursor = nullptr;
-  wc.lpszClassName = L"SubframeCursorTrailOverlay";
+  wc.lpszClassName = L"TrailOverlay";
   if (!RegisterClassExW(&wc)) {
     const DWORD err = GetLastError();
     wchar_t msg[256];
     swprintf_s(msg, L"RegisterClassExW 失败 (error=%lu)。\n\n诊断日志: %ls", err, DiagLogPath());
-    DiagFatal(L"SubframeCursorTrailOverlay", msg);
+    DiagFatal(L"Trail", msg);
     return 1;
   }
 
@@ -288,13 +284,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   // 提供，若加该样式 DWM 仍会为窗口维护重定向表面，白白多一次拷贝。
   HWND hwnd = CreateWindowExW(
       WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-      wc.lpszClassName, L"Subframe Cursor Trail Overlay  (Ctrl+Alt+Q 退出)",
+      wc.lpszClassName, L"Trail  (Ctrl+Alt+Q 退出)",
       WS_POPUP, g_originX, g_originY, vw, vh, nullptr, nullptr, hInstance, nullptr);
   if (!hwnd) {
     const DWORD err = GetLastError();
     wchar_t msg[256];
     swprintf_s(msg, L"CreateWindowExW 失败 (error=%lu)。\n\n诊断日志: %ls", err, DiagLogPath());
-    DiagFatal(L"SubframeCursorTrailOverlay", msg);
+    DiagFatal(L"Trail", msg);
     return 1;
   }
   // alpha=255：窗口内容不透明度不变（DComp 视觉树自带逐像素 alpha），
@@ -312,7 +308,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
                L"渲染器初始化失败：需要硬件 D3D11 设备与 flip-model 交换链\n"
                L"（不降级 WARP）。请查看上方/日志中的具体失败步骤。\n\n诊断日志: %ls",
                DiagLogPath());
-    DiagFatal(L"SubframeCursorTrailOverlay", msg);
+    DiagFatal(L"Trail", msg);
     DestroyWindow(hwnd);
     return 1;
   }
@@ -330,7 +326,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   VsyncState vsync;
   const bool lowLatency = CalibrateVsync(vsync);
   if (!lowLatency) DiagLog(L"[main] vsync calibration failed, falling back to Present(1,0)");
-  double budgetMs = 3.0;
+  double budgetMs = 2.0;
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
   // 主线程自己提升定时器分辨率（不依赖采样线程的副作用），退出时恢复。
@@ -354,22 +350,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
       const uint64_t t0 = QpcNow();
       RenderOneFrame(false);
       const uint64_t t1 = QpcNow();
-      // 渲染耗时 EMA -> 自适应预算：EMA + 1.5ms 余量。
+      // 渲染耗时 EMA -> 自适应预算：EMA + 1.0ms 余量。
       // 上限受刷新周期约束（预算必须小于一个周期，否则 target 越过当前
-      // vsync 导致对齐失效），并限幅 [2, 8]ms。
+      // vsync 导致对齐失效），并限幅 [1, 8]ms。
       const double renderMs =
           static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(freq.QuadPart);
       vsync.emaRenderMs = vsync.emaRenderMs * 0.9 + renderMs * 0.1;
       const double periodMs =
           static_cast<double>(vsync.period) * 1000.0 / static_cast<double>(freq.QuadPart);
-      budgetMs = vsync.emaRenderMs + 1.5;
-      if (budgetMs < 2.0) budgetMs = 2.0;
+      // 自适应预算：EMA + 1.0ms 余量，限幅 [1, 8]ms（配合脏矩形清除与延迟采样，
+      // 渲染更快，故下限/余量较旧值收紧，让 Present 更贴近 vsync）。
+      budgetMs = vsync.emaRenderMs + 1.0;
+      if (budgetMs < 1.0) budgetMs = 1.0;
       if (budgetMs > 8.0) budgetMs = 8.0;
       const double budgetMax = periodMs * 0.6;
       if (budgetMs > budgetMax) budgetMs = budgetMax;
       ++vsync.frameCount;
       if (t1 > vsync.anchor) ++vsync.missed;  // 渲染在目标 vsync 后才完成 -> 错过
-      if (vsync.frameCount % 300 == 0) {
+      if (vsync.frameCount % 3000 == 0) {
         DiagLog(L"[vsync] frames=%llu missed=%llu (%.1f%%), render EMA=%.2f ms, budget=%.2f ms",
                 static_cast<unsigned long long>(vsync.frameCount),
                 static_cast<unsigned long long>(vsync.missed),
