@@ -6,18 +6,56 @@ Windows 全屏透明叠加层：用 C++ + Direct2D 绘制**帧内鼠标尾迹** 
 
 ## 构建
 
+### 前置条件
+
+- Windows 10/11（需启用桌面合成 DWM）
+- **Visual Studio 2017+**：安装"使用 C++ 的桌面开发"工作负载（含 MSVC 编译器、Windows SDK、Ninja）
+- **CMake 3.16+**（加入 PATH；https://cmake.org 或 `winget install cmake`）
+- Ninja 可选（VS2019+ 自带；无 Ninja 时脚本自动回退 MSBuild）
+
+### 方式一：build.bat（推荐）
+
 ```bat
-build.bat
+build.bat            # Release 构建
+build.bat Debug      # Debug 构建
 ```
 
-脚本通过 `vswhere` 自动定位 Visual Studio（需安装"使用 C++ 的桌面开发"），
-生成 `build\subframe_cursor_trail.exe`。手动方式：
+脚本流程：`vswhere` 自动定位 VS → 调用 `vcvarsall.bat x64` 设置编译环境 →
+优先用 Ninja 生成器（找不到则回退 Visual Studio/MSBuild 生成器）→ 编译。
+产物路径：
+
+| 生成器 | 输出 |
+|---|---|
+| Ninja | `build\subframe_cursor_trail.exe` |
+| Visual Studio (MSBuild) | `build\Release\subframe_cursor_trail.exe`（或 `build\Debug\...`） |
+
+### 方式二：手动命令（cmd，Ninja）
+
+Visual Studio 安装路径按实际情况修改（可用 `vswhere -latest -property installationPath` 查询）：
 
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+### 方式三：手动命令（cmd，MSBuild，无需 Ninja/vcvarsall）
+
+```bat
+cmake -S . -B build        REM 生成 Visual Studio 工程（多配置）
+cmake --build build --config Release
+```
+
+### 常见问题
+
+- **`[ERROR] Visual Studio C++ toolchain not found`**：未安装 VS 或缺少 C++ 工作负载，
+  打开 Visual Studio Installer 勾选"使用 C++ 的桌面开发"后重试。
+- **`cmake 不是内部或外部命令`**：未安装 CMake 或未加入 PATH。
+- **编译报找不到 `d2d1.h` / `d3d11.h` / `dcomp.h`**：必须在 vcvarsall x64（或 VS
+  开发者命令提示符）环境中编译；直接双击 build.bat 也会自动配置该环境。
+- **`The build directory is incompatible with the generator`**：`build/` 之前用别的
+  生成器配置过，删除 `build/` 目录后重新构建。
+- 构建/运行问题可查看 exe 同目录的 `subframe_cursor_trail.log`（见"已知限制"）。
 
 ## 运行
 
