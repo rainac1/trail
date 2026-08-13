@@ -3,7 +3,7 @@ project(trail LANGUAGES CXX)
 
 add_executable(trail WIN32
   src/main.cpp
-  src/cursor_sampler.cpp
+  src/mouse_history.cpp
   src/cursor_texture.cpp
   src/diag.cpp
   src/overlay_renderer.cpp

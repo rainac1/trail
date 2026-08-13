@@ -7,7 +7,7 @@
 #include <dcomp.h>
 #include <dxgi1_2.h>
 
-#include "cursor_sampler.h"
+#include "mouse_history.h"
 
 // Direct2D + DirectComposition 全屏透明叠加渲染器（硬件 GPU，无软件降级）。
 //
@@ -32,10 +32,10 @@ class OverlayRenderer {
 
   // 绘制一帧：把 cursorBmp 绘制到每个采样点位置（热点对齐），然后离屏 ->
   // swapchain 拷贝并 Present。samples 为历史尾迹点（按时间升序）。drawLiveHead
-  // 为 true 时，在历史点渲染完成、EndDraw 之后（CopyResource 之前）重新采样
-  // 当前光标位置并单独绘制头部点 —— 把头部点采样推迟到提交前最后一刻，压缩
-  // 头部延迟。waitForVBlank=false 时 Present(0) 不等待 vsync（由调用方做 vblank
-  // 前对齐）；true 时 Present(1,0) 阻塞等 vsync。
+  // 为 true 时，在历史点渲染完成、EndDraw 之后（CopyResource 之前）用 GetCursorInfo
+  // 最后一刻采样当前光标位置并单独绘制头部点 —— 替代 GetCursorPos，且把头部采样
+  // 推迟到提交前最后一刻以压缩头部延迟。waitForVBlank=false 时 Present(0) 不等待
+  // vsync（由调用方做 vblank 前对齐）；true 时 Present(1,0) 阻塞等 vsync。
   bool RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY,
                    const Sample* samples, uint32_t count, int originX, int originY,
                    bool waitForVBlank, bool drawLiveHead);

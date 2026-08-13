@@ -1,10 +1,10 @@
 # Trail
 
 A Windows full-screen transparent overlay that renders a **sub-frame cursor trail**
-with C++ + Direct2D: it captures every cursor sample within the past frame and draws
-the pointer texture at each position on the next frame. Each sample is shown for
-exactly one frame before disappearing, so the trail length ≈ the cursor's movement
-over one frame.
+with C++ + Direct2D: it retrieves every cursor movement sample within the past
+frame and draws the pointer texture at each position on the next frame. Each
+sample is shown for exactly one frame before disappearing, so the trail length ≈
+the cursor's movement over one frame.
 
 ## Building
 
@@ -66,8 +66,7 @@ cmake --build build --config Release
 ## Running
 
 ```bat
-build\trail.exe                # default 1000 Hz sampling
-build\trail.exe --sample-ms 2  # 500 Hz sampling (lower CPU)
+build\trail.exe                # default
 build\trail.exe --hide-cursor  # also hide the system cursor (inside the overlay)
 ```
 
@@ -77,30 +76,31 @@ build\trail.exe --hide-cursor  # also hide the system cursor (inside the overlay
 
 ## How it works
 
-### Thread model (two threads)
+### Thread model (single thread)
 
-| Thread | Responsibility |
-|---|---|
-| Main thread | Creates the window, runs the message loop, renders. `Present(1, 0)` blocks on vsync; nearly zero CPU when idle. |
-| Sampler thread | `THREAD_PRIORITY_HIGHEST`; polls `GetCursorPos` every `--sample-ms` (default 1 ms ≈ 1000 Hz) and pushes `(QPC timestamp, x, y)` into a lock-free SPSC ring buffer. |
-
-The sampler and render threads synchronize through a **lock-free single-producer /
-single-consumer ring buffer** (`src/ring_buffer.h`) using release/acquire atomic
-pairs for visibility — no locks, no dynamic allocation on the hot path.
+The program runs entirely on **one thread**: the main thread creates the window,
+runs the message loop, and renders. There is no sampler thread and no shared ring
+buffer. Instead, once per frame the render thread calls `GetMouseMovePointsEx` on
+demand and pulls the mouse-movement points it has not drawn yet out of the system's
+own 64-point mouse-move history — the OS records the raw movement history for us, so
+we no longer poll `GetCursorPos` on a high-priority background thread.
 
 ### Sub-frame trail semantics
 
-The render thread records the previous frame's timestamp `T_prev`, and each frame
-draws only the samples in `t ∈ [T_prev, T_now)`. Because the frame windows tile the
-timeline seamlessly, **each sample is drawn exactly once**: the newest sample appears
-on the frame after it was sampled, then slides out of the window and disappears. The
-trail consists of the positions the cursor passed through during the last frame —
-render frame rate caps the trail "age", sampling rate determines path accuracy
-(`RenderOneFrame` in `src/main.cpp`).
+`GetMouseMovePointsEx` returns the anchor point and up to 63 points *before* it
+(newest first) and does **not** consume the history, so the render thread keeps a
+`(x, y, time)` watermark of the newest point it has already drawn. Each frame it
+reads the whole history and keeps only the prefix that is newer than the watermark,
+then advances the watermark. Each movement point is therefore drawn exactly once —
+on the frame after it happened — and disappears on the next frame, so the trail is
+exactly the cursor's movement over one frame. Path accuracy is now set by the
+system's mouse report rate rather than by a polling interval.
 
-As a safety net, the window start is clamped to `now - one refresh period`, so the
-trail never stretches beyond one frame even if a frame misses its vsync (older
-samples are dropped instead of being drawn all at once).
+`CollectMouseHistory` (`src/mouse_history.cpp`) handles the API's quirks: the
+16-bit wrap-around of negative multi-monitor coordinates, the `-1` "anchor not
+found" case (when the watermark was pushed out of the 64-point window after a long
+stall), and the newest-first output order. If more than 64 raw moves occur between
+two frames, the middle of the trail is dropped (the system only keeps 64 points).
 
 ### Pointer texture (Windows API)
 
@@ -119,8 +119,8 @@ down to a few milliseconds:
 
 - **`DwmFlush` bootstrap calibration**: measures the composition refresh period and
   vsync phase (≈ 8.3 ms @ 120 Hz / 16.7 ms @ 60 Hz)
-- **vblank-front alignment**: sleeps (`Sleep(1)`) until ~1 ms before
-  `next_vsync - budget`, then busy-spins (`YieldProcessor`) for the final 1 ms so the
+- **vblank-front alignment**: sleeps (`Sleep(1)`) until ~2 ms before
+  `next_vsync - budget`, then busy-spins (`YieldProcessor`) for the final 2 ms so the
   render thread wakes *just before* the vsync deadline, then `Present(0)` lands the
   frame on the *current* vsync instead of the *next* one (the old `Present(1,0)`
   waited half a frame or more on average)
@@ -128,15 +128,18 @@ down to a few milliseconds:
   loop does *not* idle-wait for the following vsync — it renders immediately and
   re-anchors the phase, so one missed vsync doesn't stretch the next frame's interval
   into two periods (which would otherwise pile two frames of trail into one frame)
-- **Live head point, sampled late**: `GetCursorPos` is called at the last moment —
-  after the historical trail is drawn and `EndDraw`'d, just before `CopyResource` —
-  and the head point is drawn in a second `BeginDraw/EndDraw` pass. Head latency ≈
-  the render budget (copy + present), not the whole draw
+- **Live head point, sampled late**: `GetCursorInfo` is called again at the last
+  moment — after the historical trail is drawn and `EndDraw`'d, just before
+  `CopyResource` — and the head point is drawn in a second `BeginDraw/EndDraw` pass.
+  Head latency ≈ the render budget (copy + present), not the whole draw
 - **Adaptive budget**: render-time EMA + 1.0 ms margin, clamped to [1, 8] ms,
   tightening automatically when rendering is fast
+- **High-priority render thread**: the main thread is raised to
+  `THREAD_PRIORITY_HIGHEST` (never `TIME_CRITICAL`, which would preempt DWM/game
+  threads) so the busy-wait and render are less likely to be preempted into a miss
 - On calibration failure (no DWM composition) it falls back to `Present(1,0)`; the
   log prints `missed` (fraction of frames whose render overran the target vsync,
-  ~0.2 % measured) and budget stats every 3000 frames
+  ~0.2 % measured) and `budget` stats every 3000 frames
 - `IDXGISwapChain2::SetMaximumFrameLatency(1)` caps the DWM composition queue depth
 
 ### Transparent rendering (DirectComposition + hardware GPU single path)
@@ -168,13 +171,14 @@ down to a few milliseconds:
 
 ## Performance notes
 
-- Zero-allocation render hot path: samples are collected into a fixed stack array,
-  and the cursor texture is captured only when its shape changes
-- Lock-free SPSC ring buffer: `Capacity = 4096`, tolerating ~4 s of render stall at
-  1000 Hz without dropping order
-- Sampler thread uses `timeBeginPeriod(1)` for timer precision; high priority but not
-  `TIME_CRITICAL`, to avoid preempting DWM / game threads
-- The main loop is naturally throttled by vsync; idle CPU usage is very low
+- Zero-allocation render hot path: samples are collected into a fixed stack array
+  (`GetMouseMovePointsEx` writes into a stack `MOUSEMOVEPOINT[64]`), and the cursor
+  texture is captured only when its shape changes
+- One `GetCursorInfo` + one `GetMouseMovePointsEx` per frame — no background thread,
+  no locks, no dynamic allocation; idle CPU usage is very low (throttled by vsync)
+- The system mouse-move history is a fixed 64-point buffer shared across all
+  threads/processes; movement between frames is bounded by the mouse report rate
+  (typically ≤ 1000 Hz), well under 64 points per frame at normal refresh rates
 
 ## Known limitations
 
@@ -191,5 +195,10 @@ down to a few milliseconds:
   failing step and HRESULT; set `TRAIL_NO_UI=1` to suppress the dialog (the legacy
   `SUBFRAME_NO_UI` name is still accepted)
 - The trail head still lags the system cursor by roughly one render budget (a few
-  milliseconds — the physical floor of sample → DWM composite), plus the sampler
-  thread's quantization (1 ms by default)
+  milliseconds — the physical floor of sample → DWM composite)
+- The trail path resolution is bounded by the system mouse report rate (typically
+  125–1000 Hz) rather than by an explicit sampling interval; extremely fast flicks
+  can still be under-sampled
+- The system mouse history stores coordinates in 16-bit form, so virtual-desktop
+  coordinates are limited to ±32767; layouts wider/taller than 32768 px can mis-track
+  (a rare, multi-8K-monitor edge case)

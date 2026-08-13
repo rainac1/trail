@@ -1,28 +1,27 @@
 // 帧内鼠标尾迹全屏透明叠加层
 //
 // 线程模型：
-//   主线程    —— 窗口 + 消息循环 + 渲染（Present(1,0) 由 vsync 节流）
-//   采样线程  —— THREAD_PRIORITY_HIGHEST，~1000Hz 轮询 GetCursorPos，
-//                把 (QPC 时间戳, 坐标) 写入无锁 SPSC 环形缓冲
+//   单线程 —— 窗口 + 消息循环 + 渲染（Present(1,0) 由 vsync 节流）。
+//   无独立采样线程：渲染线程每帧唤醒时按需调用 GetMouseMovePointsEx，从系统
+//   自维护的 64 点鼠标移动历史中增量取回本帧轨迹。
 //
-// 帧内尾迹语义：渲染线程记录上一帧时刻 T_prev，每帧只绘制 t∈[T_prev, T_now)
-// 的采样点。帧窗口无缝连续覆盖整个时间线，因此每个采样点恰好被绘制一帧后
-// 消失 —— 尾迹长度 = 一帧内的鼠标位移，采样率越高路径越精确。
+// 帧内尾迹语义：渲染线程用 (x,y,time) 水印追踪系统历史的消费进度，每帧只绘制
+// 自上次调用以来新增的移动点。每个采样点恰好被绘制一帧后消失 —— 尾迹长度 =
+// 一帧内的鼠标位移，路径精度由系统鼠标报告率决定。
 #include <windows.h>
 #include <wrl/client.h>
 
 #include <intrin.h>
 
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include <dwmapi.h>
 
-#include "cursor_sampler.h"
 #include "cursor_texture.h"
 #include "diag.h"
+#include "mouse_history.h"
 #include "overlay_renderer.h"
 
 namespace {
@@ -31,10 +30,9 @@ constexpr UINT kQuitHotkeyId = 1;
 
 OverlayRenderer g_renderer;
 CursorTexture g_cursorTex;  // 光标纹理缓存（形状变化时才重建）
-uint64_t g_lastFrameQpc = 0;
 int g_originX = 0, g_originY = 0;  // 虚拟屏幕原点（窗口左上角）
 bool g_hideCursor = false;
-HANDLE g_samplerThread = nullptr;
+MouseHistoryTracker g_mouseHistory;  // 系统鼠标历史的增量读取状态
 // ---- 低延迟渲染：vblank 前对齐（Present(0) 赶上当前 vsync 显示）----
 struct VsyncState {
   uint64_t period = 0;    // 合成刷新周期（QPC ticks）
@@ -43,7 +41,7 @@ struct VsyncState {
   uint64_t frameCount = 0;
   uint64_t missed = 0;    // 渲染超时错过目标 vsync 的次数
 };
-// 主线程独占的 vsync 校准/对齐状态（含刷新周期，供 RenderOneFrame 做窗口裁剪）。
+// 主线程独占的 vsync 校准/对齐状态（含刷新周期，供低延迟渲染对齐）。
 static VsyncState g_vsync;
 
 static uint64_t QpcNow() {
@@ -107,22 +105,23 @@ static void RefreshVsyncPeriod(VsyncState& s) {
   s.anchor = t1;
 }
 
-// 忙等（分层等待）到 下一 vsync - budgetMs，返回时渲染可赶上当前 vsync。
-// 返回 true 表示起步时已错过目标 vsync（上一帧渲染超时，或首帧），本帧不等待、
-// 立即渲染追赶。唤醒分两段：远离 target 用 Sleep(1) 粗睡省 CPU，进入最后 1ms
-// 纯忙等（YieldProcessor）精确对齐到 target，吸收 Sleep(1) 的过冲，保证唤醒点
-// 稳定略早于 vsync 而不睡过头。
-static bool WaitForVsyncAligned(VsyncState& s, double budgetMs) {
+// 忙等（分层等待）到 下一 vsync - leadMs，返回时渲染可赶上当前 vsync。
+// leadMs 是唤醒提前量（渲染预算）。返回 true 表示起步时已
+// 错过目标 vsync（上一帧渲染超时，或首帧），本帧不等待、立即渲染追赶。唤醒分
+// 两段：远离 target 用 Sleep(1) 粗睡省 CPU，进入最后 spinMargin（2ms）纯忙等
+// （YieldProcessor）精确对齐到 target —— 忙等缓冲足够吸收 Sleep(1) 在
+// timeBeginPeriod(1) 下的过冲（约 ≤1.5ms），保证唤醒点精确落在 target、既不睡
+// 过头（睡过头会压缩渲染预算、增加错过 vsync 的概率）也不提前太多。
+static bool WaitForVsyncAligned(VsyncState& s, double leadMs) {
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
-  const uint64_t budget =
-      static_cast<uint64_t>(budgetMs * static_cast<double>(freq.QuadPart) / 1000.0);
+  const uint64_t lead =
+      static_cast<uint64_t>(leadMs * static_cast<double>(freq.QuadPart) / 1000.0);
   const uint64_t now = QpcNow();
 
   // 已错过目标 vsync：不空等、立即渲染追赶，避免空等把"漏一帧"放大成
-  // "帧间隔翻倍"——否则下一帧的尾迹窗口 [T_prev, T_now) 会跨越两个刷新周期，
-  // 出现"一帧渲染两帧轨迹"的积压。仍把相位推进到未来最近的同相位 vsync，
-  // 供下一帧重新对齐节奏。
+  // "帧间隔翻倍"——否则下一帧会一次性画出更长时间窗口内积累的轨迹，尾迹被
+  // 拉长。仍把相位推进到未来最近的同相位 vsync，供下一帧重新对齐节奏。
   if (now >= s.anchor) {
     s.anchor = s.anchor + s.period * ((now - s.anchor) / s.period + 1);
     return true;
@@ -131,11 +130,9 @@ static bool WaitForVsyncAligned(VsyncState& s, double budgetMs) {
   // 锚点未到（上一帧提前完成）：本帧只能排到 anchor + period（DWM 一帧
   // 占一个 vsync 槽），若复用当前 anchor 会导致渲染逐帧逼近 vsync 直至错过。
   s.anchor = s.anchor + s.period;
-  const uint64_t target = s.anchor - budget;
-  // 纯忙等缓冲区：足够吸收 Sleep(1) 在 timeBeginPeriod(1) 下的过冲（约 ≤0.5ms），
-  // 使唤醒点精确落在 target（= vsync - budget）上，稳定略早于 vsync 而不睡过头。
+  const uint64_t target = s.anchor - lead;
   const uint64_t spinMargin =
-      static_cast<uint64_t>(1.0 * static_cast<double>(freq.QuadPart) / 1000.0);
+      static_cast<uint64_t>(2.0 * static_cast<double>(freq.QuadPart) / 1000.0);
   for (;;) {
     const uint64_t t = QpcNow();
     if (t >= target) break;
@@ -143,7 +140,7 @@ static bool WaitForVsyncAligned(VsyncState& s, double budgetMs) {
     if (remain > spinMargin) {
       Sleep(1);  // 还远：粗睡省 CPU
     } else {
-      YieldProcessor();  // 最后 1ms：纯忙等，降低自旋功耗与总线争用
+      YieldProcessor();  // 最后 2ms：纯忙等，降低自旋功耗与总线争用
     }
   }
   return false;
@@ -153,7 +150,6 @@ void PrintUsage() {
   wprintf(
       L"Trail\n"
       L"Usage: trail.exe [options]\n"
-      L"  --sample-ms <N>   sample interval in ms, default 1 (~1000 Hz)\n"
       L"  --hide-cursor     hide the system cursor (within this overlay window)\n"
       L"  --help            show this help\n"
       L"Quit: Ctrl+Alt+Q\n");
@@ -184,33 +180,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void RenderOneFrame(bool waitForVBlank) {
-  LARGE_INTEGER now;
-  QueryPerformanceCounter(&now);
-  const uint64_t nowQ = static_cast<uint64_t>(now.QuadPart);
-  // 尾迹窗口起点默认取上帧时刻 T_prev。若本帧与上一帧间隔超过一个刷新周期
-  // （漏帧），把起点前移到"最近一个刷新周期"，避免一次性画出两帧的轨迹。
-  uint64_t windowStart = g_lastFrameQpc;  // 上帧时刻 T_prev
-  if (g_vsync.period > 0 && nowQ > g_vsync.period) {
-    const uint64_t cutoff = nowQ - g_vsync.period;
-    if (windowStart < cutoff) windowStart = cutoff;
-  }
-
-  // 消费自上次以来的新增采样点，只保留落在 [T_prev, T_now) 内的。
-  Sample pts[512];
-  uint32_t n = 0;
-  const uint32_t head = g_ring.ReadHead();
-  uint32_t from = g_consumerIndex.load(std::memory_order_relaxed);
-  for (uint32_t i = from; i < head && n < 512; ++i) {
-    const Sample s = g_ring.At(i);
-    // 严格属于本帧窗口 [T_prev, T_now) 才绘制；其余已过期，丢弃。
-    if (s.t >= windowStart && s.t < nowQ) pts[n++] = s;
-  }
-  g_consumerIndex.store(head, std::memory_order_relaxed);
-
-  // 实时头部点改为在 RenderFrame 内部、历史点 EndDraw 之后（CopyResource 之前）
-  // 延迟采样，见 overlay_renderer.cpp —— 把头部点采样从渲染管线最前端推迟到
-  // 提交前最后一刻，头部延迟从约一个渲染预算压缩到 CopyResource+Present 量级。
-
   // 光标纹理：仅当 hCursor 句柄变化时才重新抓取（游戏中光标形状几乎不变，
   // 该路径每帧仅一次 GetCursorInfo，开销约 1µs）。
   ID2D1Bitmap* cursorBmp = nullptr;
@@ -232,16 +201,22 @@ void RenderOneFrame(bool waitForVBlank) {
     }
   }
 
+  // 从系统鼠标移动历史按需取回本帧轨迹（替代独立采样线程的 GetCursorPos 轮询）。
+  // GetCursorInfo 已返回当前位置 ci.ptScreenPos，作 GetMouseMovePointsEx 的 anchor。
+  // 实时头部点由 RenderFrame 在提交前最后一刻用 GetCursorInfo 重新采样。
+  Sample pts[512];
+  const uint32_t n = static_cast<uint32_t>(
+      CollectMouseHistory(pts, 512, g_mouseHistory, ci.ptScreenPos.x, ci.ptScreenPos.y));
+
   g_renderer.RenderFrame(cursorBmp, texW, texH, hotX, hotY, pts, n, g_originX, g_originY,
-                         waitForVBlank, /*drawLiveHead=*/true);
-  g_lastFrameQpc = nowQ;
+                         waitForVBlank, /*drawLiveHead=*/cursorBmp != nullptr);
 }
 
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/, int /*show*/) {
-  // Per-monitor DPI 感知（v2）：GetCursorPos / GetSystemMetrics 均返回物理像素，
-  // 与 D2D 渲染坐标一致。
+  // Per-monitor DPI 感知（v2）：GetCursorInfo / GetMouseMovePointsEx / GetSystemMetrics
+  // 均返回物理像素，与 D2D 渲染坐标一致。
   HMODULE user32 = GetModuleHandleW(L"user32.dll");
   auto setDpiAwarenessContext =
       reinterpret_cast<BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT)>(GetProcAddress(
@@ -260,14 +235,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     const wchar_t* a = __wargv[i];
     if (wcscmp(a, L"--hide-cursor") == 0) {
       g_hideCursor = true;
-    } else if (wcscmp(a, L"--sample-ms") == 0 && i + 1 < __argc) {
-      g_sampleMs = _wtoi(__wargv[++i]);
     } else if (wcscmp(a, L"--help") == 0) {
       PrintUsage();
       return 0;
     }
   }
-  if (g_sampleMs < 1) g_sampleMs = 1;
 
   // 覆盖整个虚拟桌面（含多显示器）。
   g_originX = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -328,9 +300,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   }
   DiagLog(L"[main] renderer ready, %d x %d", vw, vh);
 
-  // 启动高优先级采样线程。
-  g_samplerThread = CreateThread(nullptr, 0, SamplerThreadMain, nullptr, 0, nullptr);
-
   RegisterHotKey(hwnd, kQuitHotkeyId, MOD_CONTROL | MOD_ALT, 'Q');
 
   // 主循环：消息 + 低延迟渲染。
@@ -342,8 +311,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   double budgetMs = 2.0;
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
-  // 主线程自己提升定时器分辨率（不依赖采样线程的副作用），退出时恢复。
+  // 提升定时器分辨率，使低延迟等待里的 Sleep(1) 接近 1ms；退出时恢复。
   timeBeginPeriod(1);
+  // 提升渲染线程（主线程）优先级：低延迟 vsync 对齐对调度抖动敏感，普通优先级
+  // 下忙等/渲染易被抢占导致错过 vsync。用 HIGHEST 而非 TIME_CRITICAL，避免抢占
+  // DWM / 游戏线程。退出时恢复。
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
   MSG msg{};
   bool running = true;
@@ -359,28 +332,30 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     if (!running) break;
 
     if (lowLatency) {
+      const double periodMs =
+          static_cast<double>(g_vsync.period) * 1000.0 / static_cast<double>(freq.QuadPart);
+
       const bool startedLate = WaitForVsyncAligned(g_vsync, budgetMs);
       const uint64_t t0 = QpcNow();
       RenderOneFrame(false);
       const uint64_t t1 = QpcNow();
-      // 渲染耗时 EMA -> 自适应预算：EMA + 1.0ms 余量。
-      // 上限受刷新周期约束（预算必须小于一个周期，否则 target 越过当前
-      // vsync 导致对齐失效），并限幅 [1, 8]ms。
+      // 渲染耗时 EMA -> 自适应预算：EMA + 1.0ms 余量，限幅 [1, 8]ms（配合脏矩形
+      // 清除与延迟采样，渲染更快，故下限/余量较旧值收紧，让 Present 更贴近 vsync）。
       const double renderMs =
           static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(freq.QuadPart);
       g_vsync.emaRenderMs = g_vsync.emaRenderMs * 0.9 + renderMs * 0.1;
-      const double periodMs =
-          static_cast<double>(g_vsync.period) * 1000.0 / static_cast<double>(freq.QuadPart);
-      // 自适应预算：EMA + 1.0ms 余量，限幅 [1, 8]ms（配合脏矩形清除与延迟采样，
-      // 渲染更快，故下限/余量较旧值收紧，让 Present 更贴近 vsync）。
       budgetMs = g_vsync.emaRenderMs + 1.0;
       if (budgetMs < 1.0) budgetMs = 1.0;
       if (budgetMs > 8.0) budgetMs = 8.0;
       const double budgetMax = periodMs * 0.6;
       if (budgetMs > budgetMax) budgetMs = budgetMax;
       ++g_vsync.frameCount;
+
       // 错过：起步就晚（startedLate），或渲染在目标 vsync 后才完成（t1 > anchor）。
-      if (startedLate || t1 > g_vsync.anchor) ++g_vsync.missed;
+      if (startedLate || t1 > g_vsync.anchor) {
+        ++g_vsync.missed;
+      }
+
       if (g_vsync.frameCount % 3000 == 0) {
         DiagLog(L"[vsync] frames=%llu missed=%llu (%.1f%%), render EMA=%.2f ms, budget=%.2f ms",
                 static_cast<unsigned long long>(g_vsync.frameCount),
@@ -394,14 +369,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     }
   }
   timeEndPeriod(1);
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
 
   // 清理
   UnregisterHotKey(hwnd, kQuitHotkeyId);
-  g_stopSampler.store(true, std::memory_order_relaxed);
-  if (g_samplerThread) {
-    WaitForSingleObject(g_samplerThread, 2000);
-    CloseHandle(g_samplerThread);
-  }
   g_cursorTex.bitmap.Reset();
   g_renderer.Shutdown();
   DestroyWindow(hwnd);

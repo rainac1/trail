@@ -222,10 +222,12 @@ bool OverlayRenderer::RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, in
   if (hr == D2DERR_RECREATE_TARGET) return false;  // 设备丢失（未做重建，见 README）
 
   // ---- pass 2：实时头部点（提交前最后一刻采样，最小化头部延迟）----
+  // 用 GetCursorInfo（替代 GetCursorPos）在历史点 EndDraw 之后、CopyResource 之前
+  // 采样当前光标位置并绘制，把头部采样推迟到提交前最后一刻。
   if (drawLiveHead && cursorBmp) {
-    POINT pt;
-    if (GetCursorPos(&pt)) {
-      const D2D1_RECT_F dst = dstFor(pt.x, pt.y);
+    CURSORINFO ci{sizeof(ci)};
+    if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING)) {
+      const D2D1_RECT_F dst = dstFor(ci.ptScreenPos.x, ci.ptScreenPos.y);
       ctx_->BeginDraw();
       ctx_->DrawBitmap(cursorBmp, dst, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
       hr = ctx_->EndDraw();
