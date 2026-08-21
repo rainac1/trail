@@ -101,7 +101,7 @@ bool OverlayRenderer::Initialize(HWND hwnd, int width, int height) {
   }
 
   // composition swapchain：premultiplied alpha 由 DWM 视觉树合成。
-  // 注意：FLIP_SEQUENTIAL 每次 Present 轮换 backbuffer，因此每帧都必须重新
+  // 注意：FLIP_DISCARD 每次 Present 轮换 backbuffer，因此每帧都必须重新
   // GetBuffer(0) 获取当前后缓冲，不能缓存纹理（见 RenderFrame）。
   DXGI_SWAP_CHAIN_DESC1 desc{};
   desc.Width = static_cast<UINT>(width);
@@ -111,7 +111,7 @@ bool OverlayRenderer::Initialize(HWND hwnd, int width, int height) {
   desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
   desc.BufferCount = 2;
   desc.Scaling = DXGI_SCALING_STRETCH;
-  desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+  desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
   desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
   hr = dxgiFactory_->CreateSwapChainForComposition(d3dDevice_.Get(), &desc, nullptr, &swapChain_);
   if (FAILED(hr)) {
@@ -245,7 +245,7 @@ bool OverlayRenderer::RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, in
   }
 
   // 离屏渲染结果 -> 当前 swapchain backbuffer（GPU 显存拷贝），再 Present。
-  // FLIP_SEQUENTIAL 每帧轮换 buffer，故必须每帧重新 GetBuffer(0)。
+  // FLIP_DISCARD 每帧轮换 buffer，故必须每帧重新 GetBuffer(0)。
   if (d3dCtx_ && offscreen_) {
     Microsoft::WRL::ComPtr<IDXGISurface> backSurface;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backTex;
