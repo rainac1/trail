@@ -1,41 +1,50 @@
 # Trail
 
-A Windows full-screen transparent overlay that renders a **sub-frame cursor trail**
-with C++ + Direct2D: it retrieves every cursor movement sample within the past
-frame and draws the pointer texture at each position on the next frame. Each
-sample is shown for exactly one frame before disappearing, so the trail length ≈
-the cursor's movement over one frame.
+一个 Windows 全屏透明叠加层，用 C++ + Direct2D 渲染**帧内光标尾迹**：取出上一帧
+期间记录的每一个光标移动采样点，在下一帧把光标贴图绘制在各自的位置上。每个采样点
+只显示一帧便消失，因此尾迹长度 ≈ 光标在一帧内的位移。
 
-## Building
+## 文档
 
-### Prerequisites
+详细且长期有效的项目知识都放在 `docs/` 下：
 
-- Windows 10/11 (desktop composition / DWM must be enabled)
-- **Visual Studio 2017+** with the "Desktop development with C++" workload
-  (MSVC compiler, Windows SDK, Ninja)
-- **CMake 3.16+** on `PATH` (https://cmake.org or `winget install cmake`)
-- Ninja is optional (bundled with VS2019+; the script falls back to MSBuild)
+| 文档 | 内容 |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | 单线程模型、帧内尾迹语义、光标纹理捕获、DirectComposition 透明渲染路径、低延迟 vblank 前对齐、性能特征 |
+| [`docs/device-loss-recovery.md`](docs/device-loss-recovery.md) | “渲染突然消失”这一类故障：叠加层为何会整体变透明、设备丢失如何被检出、进程内自动重建、窗口健康看门狗 |
+| [`docs/diagnostics.md`](docs/diagnostics.md) | `trail.log`（程序运行中即可读取）、日志行速查表、“尾迹不见了”的分诊步骤、工具链陷阱 |
+| [`docs/limitations.md`](docs/limitations.md) | 已知限制 |
+| [`docs/README.en.md`](docs/README.en.md) | 本 README 的英文版 |
 
-### Option 1: build.bat (recommended)
+## 构建
+
+### 前置要求
+
+- Windows 10/11（必须启用桌面合成 / DWM）
+- **Visual Studio 2017+**，需安装“使用 C++ 的桌面开发”工作负载（MSVC 编译器、Windows
+  SDK、Ninja）
+- **CMake 3.16+** 在 `PATH` 上（https://cmake.org 或 `winget install cmake`）
+- Ninja 可选（VS2019+ 自带；脚本会自动回退到 MSBuild）
+
+### 方式一：build.bat（推荐）
 
 ```bat
-build.bat            # Release build
-build.bat Debug      # Debug build
+build.bat            # Release 构建
+build.bat Debug      # Debug 构建
 ```
 
-The script locates Visual Studio via `vswhere`, sets up the environment with
-`vcvarsall.bat x64`, prefers the Ninja generator (falls back to Visual Studio /
-MSBuild), then compiles. Output paths:
+脚本用 `vswhere` 定位 Visual Studio，通过 `vcvarsall.bat x64` 准备环境，优先使用
+Ninja 生成器（否则回退到 Visual Studio / MSBuild），然后编译。产物路径：
 
-| Generator | Output |
+| 生成器 | 产物 |
 |---|---|
 | Ninja | `build\trail.exe` |
-| Visual Studio (MSBuild) | `build\Release\trail.exe` (or `build\Debug\...`) |
+| Visual Studio (MSBuild) | `build\Release\trail.exe`（或 `build\Debug\...`） |
 
-### Option 2: manual (cmd, Ninja)
+### 方式二：手动（cmd + Ninja）
 
-Adjust the Visual Studio path to match your install (query it with
-`vswhere -latest -property installationPath`):
+请按实际安装位置修改 Visual Studio 路径（可用
+`vswhere -latest -property installationPath` 查询）：
 
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
@@ -43,162 +52,59 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-### Option 3: manual (cmd, MSBuild, no Ninja/vcvarsall)
+### 方式三：手动（cmd + MSBuild，不用 Ninja/vcvarsall）
 
 ```bat
-cmake -S . -B build        REM generates a Visual Studio project (multi-config)
+cmake -S . -B build        REM 生成 Visual Studio 工程（多配置）
 cmake --build build --config Release
 ```
 
-### Troubleshooting
+### 构建排错
 
-- **`[ERROR] Visual Studio C++ toolchain not found`**: Visual Studio or the C++
-  workload is missing. Open the Visual Studio Installer, add "Desktop development
-  with C++", and retry.
-- **`cmake is not recognized`**: CMake is not installed or not on `PATH`.
-- **Build errors for `d2d1.h` / `d3d11.h` / `dcomp.h`**: build from the `vcvarsall x64`
-  (or VS Developer Command Prompt) environment; `build.bat` does this automatically.
-- **`The build directory is incompatible with the generator`**: `build/` was
-  configured with a different generator before — delete `build/` and rebuild.
-- Build/runtime issues are logged to `trail.log` next to the exe (see "Known
-  limitations").
+- **`[ERROR] Visual Studio C++ toolchain not found`**：没装 Visual Studio、没装 C++
+  工作负载，或者装了但没有在 Visual Studio Installer 中注册（因此 `vswhere` 看不到
+  它）——见 [`docs/diagnostics.md`](docs/diagnostics.md#toolchain-pitfalls)。
+- **提示 `cmake is not recognized`**：CMake 未安装或不在 `PATH` 上。
+- **`d2d1.h` / `d3d11.h` / `dcomp.h` 编译报错**：请在 `vcvarsall x64`（或 VS 开发者
+  命令提示符）环境下构建；`build.bat` 会自动完成这一步。
+- **`The build directory is incompatible with the generator`**：`build/` 之前是用别的
+  生成器配置的——删掉 `build/` 重新构建。
+- **请用 MSVC 构建**：MinGW 会把 DWM 相关入口解析成 stub，导致程序永远走
+  `Present(1,0)` 高延迟回退路径——见
+  [`docs/diagnostics.md`](docs/diagnostics.md#toolchain-pitfalls)。
+- 构建/运行问题会记录到 exe 同目录的 `trail.log`，该文件**在程序运行期间也能读取**
+  （见 [`docs/diagnostics.md`](docs/diagnostics.md)）。
 
-## Running
+## 运行
 
 ```bat
-build\trail.exe                # default
-build\trail.exe --hide-cursor  # also hide the system cursor (inside the overlay)
+build\trail.exe                # 默认
+build\trail.exe --hide-cursor  # 同时隐藏系统光标（在叠加层范围内）
 ```
 
-- **Quit**: `Ctrl+Alt+Q`
-- The window covers the entire virtual desktop (multi-monitor), is click-through,
-  and never steals focus.
+- **退出**：`Ctrl+Alt+Q`
+- 窗口覆盖整个虚拟桌面（多显示器），点击穿透，且从不抢焦点。
 
-## How it works
+## 工作原理（简述）
 
-### Thread model (single thread)
+只有一个线程：它创建覆盖整个虚拟桌面的分层窗口、跑消息循环并逐帧渲染。取轨迹的方式
+不是轮询光标位置，而是每帧从系统自己的 64 点鼠标移动历史里（`GetMouseMovePointsEx`）
+取出“自上一帧以来新增”的采样点，把缓存的光标贴图逐一画进一张离屏 Direct2D 位图；该
+位图再拷贝进 DirectComposition 交换链，由 DWM 按逐像素 alpha 合成。每个采样点恰好被
+绘制一次，所以尾迹正好等于光标在一帧内的位移。
 
-The program runs entirely on **one thread**: the main thread creates the window,
-runs the message loop, and renders. There is no sampler thread and no shared ring
-buffer. Instead, once per frame the render thread calls `GetMouseMovePointsEx` on
-demand and pulls the mouse-movement points it has not drawn yet out of the system's
-own 64-point mouse-move history — the OS records the raw movement history for us, so
-we no longer poll `GetCursorPos` on a high-priority background thread.
+有两点值得先知道：
 
-### Sub-frame trail semantics
+- **它以合成刷新率持续运行**，每帧都在某个 vsync 之前一点点提交，使尾迹头部与系统
+  光标只差几毫秒。如果这种对齐建立不起来，它会回退到由 vsync 节流的提交方式（头部
+  延迟大约多一帧）。
+- **叠加层的像素完全由 DWM 提供**（窗口本身没有任何 GDI 内容），因此一旦
+  DXGI/DirectComposition 设备丢失，它会整体变透明，而不是“看起来坏掉”。这种情况会
+  被检出并在进程内自动恢复——见
+  [`docs/device-loss-recovery.md`](docs/device-loss-recovery.md)。
 
-`GetMouseMovePointsEx` returns the anchor point and up to 63 points *before* it
-(newest first) and does **not** consume the history, so the render thread keeps a
-`(x, y, time)` watermark of the newest point it has already drawn. Each frame it
-reads the whole history and keeps only the prefix that is newer than the watermark,
-then advances the watermark. Each movement point is therefore drawn exactly once —
-on the frame after it happened — and disappears on the next frame, so the trail is
-exactly the cursor's movement over one frame. Path accuracy is now set by the
-system's mouse report rate rather than by a polling interval.
+## 已知限制
 
-`CollectMouseHistory` (`src/mouse_history.cpp`) handles the API's quirks: the
-16-bit wrap-around of negative multi-monitor coordinates, the `-1` "anchor not
-found" case (when the watermark was pushed out of the 64-point window after a long
-stall), and the newest-first output order. If more than 64 raw moves occur between
-two frames, the middle of the trail is dropped (the system only keeps 64 points).
-
-### Pointer texture (Windows API)
-
-1. `GetCursorInfo` fetches the current cursor handle `hCursor` and visibility;
-2. `CopyIcon` + `GetIconInfo` yield the cursor bitmap and hotspot;
-3. `GetDIBits` reads 32 bpp BGRA pixels, which are alpha-premultiplied;
-4. cached as an `ID2D1Bitmap` (premultiplied) keyed by `hCursor` — **zero per-frame
-   cost while the handle is unchanged** (one `GetCursorInfo` per frame, ≈ 1 µs).
-   Animated cursors grab the current frame; legacy mask-only cursors fall back to
-   AND/XOR compositing.
-
-### Low-latency rendering (vblank-front alignment)
-
-Enabled by default; compresses the head-vs-system-cursor latency from about one frame
-down to a few milliseconds:
-
-- **`DwmFlush` bootstrap calibration**: measures the composition refresh period and
-  vsync phase (≈ 8.3 ms @ 120 Hz / 16.7 ms @ 60 Hz)
-- **vblank-front alignment**: sleeps (`Sleep(1)`) until ~2 ms before
-  `next_vsync - budget`, then busy-spins (`YieldProcessor`) for the final 2 ms so the
-  render thread wakes *just before* the vsync deadline, then `Present(0)` lands the
-  frame on the *current* vsync instead of the *next* one (the old `Present(1,0)`
-  waited half a frame or more on average)
-- **No catch-up stall after a miss**: if rendering starts after its target vsync, the
-  loop does *not* idle-wait for the following vsync — it renders immediately and
-  re-anchors the phase, so one missed vsync doesn't stretch the next frame's interval
-  into two periods (which would otherwise pile two frames of trail into one frame)
-- **Live head point, sampled late**: `GetCursorInfo` is called again at the last
-  moment — after the historical trail is drawn and `EndDraw`'d, just before
-  `CopyResource` — and the head point is drawn in a second `BeginDraw/EndDraw` pass.
-  Head latency ≈ the render budget (copy + present), not the whole draw
-- **Adaptive budget**: render-time EMA + 1.0 ms margin, clamped to [1, 8] ms,
-  tightening automatically when rendering is fast
-- **High-priority render thread**: the main thread is raised to
-  `THREAD_PRIORITY_HIGHEST` (never `TIME_CRITICAL`, which would preempt DWM/game
-  threads) so the busy-wait and render are less likely to be preempted into a miss
-- On calibration failure (no DWM composition) it falls back to `Present(1,0)`; the
-  log prints `missed` (fraction of frames whose render overran the target vsync,
-  ~0.2 % measured) and `budget` stats every 3000 frames
-- `IDXGISwapChain2::SetMaximumFrameLatency(1)` caps the DWM composition queue depth
-
-### Transparent rendering (DirectComposition + hardware GPU single path)
-
-- D2D renders into a self-owned premultiplied offscreen bitmap → per-frame GPU
-  `CopyResource` into a flip-model composition swapchain → `IDCompositionVisual::SetContent`
-  composites it in DWM with premultiplied alpha, throttled by vsync
-- Offscreen bitmap content persists across frames, so each frame **clears only the
-  bounding box of the previous frame's trail** (dirty-rect clear) instead of a full-
-  screen clear — a large GPU saving at high resolutions
-- Window styles: `WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-  | WS_EX_LAYERED`, plus `SetLayeredWindowAttributes(alpha=255)`
-- **Click-through**: `WS_EX_LAYERED | WS_EX_TRANSPARENT` makes the whole window
-  transparent to mouse hit-testing (per Microsoft's window-features docs: layered
-  window hit-testing is shape/alpha based, and `WS_EX_TRANSPARENT` then ignores the
-  shape and forwards mouse events to windows below; DComp permits a layered target
-  window). Note that `WM_NCHITTEST → HTTRANSPARENT` only forwards to same-thread
-  sibling windows, and `WS_EX_TRANSPARENT` alone has no hit-test effect — neither is
-  a correct cross-process click-through mechanism
-- Hardware D3D11 device only, **no WARP software fallback**: on failure it shows an
-  error and writes to the log
-- Why DirectComposition instead of flip+Hwnd: some display stacks (e.g. AMD Radeon
-  780M iGPU) return `DXGI_ERROR_INVALID_CALL`/`E_INVALIDARG` from
-  `CreateSwapChainForHwnd`/`CreateBitmapFromDxgiSurface` with premultiplied alpha,
-  whereas `CreateSwapChainForComposition` + offscreen blit works everywhere and is
-  the only reliable hardware transparent path in this scenario
-- Every frame clears to transparent (dirty-rect) and draws each sample with
-  `DrawBitmap` (`NEAREST_NEIGHBOR` — 1:1 sharp and cheapest)
-
-## Performance notes
-
-- Zero-allocation render hot path: samples are collected into a fixed stack array
-  (`GetMouseMovePointsEx` writes into a stack `MOUSEMOVEPOINT[64]`), and the cursor
-  texture is captured only when its shape changes
-- One `GetCursorInfo` + one `GetMouseMovePointsEx` per frame — no background thread,
-  no locks, no dynamic allocation; idle CPU usage is very low (throttled by vsync)
-- The system mouse-move history is a fixed 64-point buffer shared across all
-  threads/processes; movement between frames is bounded by the mouse report rate
-  (typically ≤ 1000 Hz), well under 64 points per frame at normal refresh rates
-
-## Known limitations
-
-- D3D device loss is not handled (`D2DERR_RECREATE_TARGET` is skipped; rare)
-- With mixed-DPI multi-monitor setups the cross-screen window is scaled by DWM and
-  trail coordinates can be offset; single-DPI is recommended
-- `--hide-cursor` hides the cursor only inside the overlay (which covers the whole
-  desktop, so effectively global)
-- When a cursor handle is reused by the system (same shape), the cache hits and the
-  texture stays correct
-- Requires a D3D11-hardware-accelerated GPU and enabled desktop composition (DWM);
-  the program refuses to start without a hardware device (no WARP downgrade)
-- On initialization failure, a `MessageBox` and `trail.log` (next to the exe) show the
-  failing step and HRESULT; set `TRAIL_NO_UI=1` to suppress the dialog (the legacy
-  `SUBFRAME_NO_UI` name is still accepted)
-- The trail head still lags the system cursor by roughly one render budget (a few
-  milliseconds — the physical floor of sample → DWM composite)
-- The trail path resolution is bounded by the system mouse report rate (typically
-  125–1000 Hz) rather than by an explicit sampling interval; extremely fast flicks
-  can still be under-sampled
-- The system mouse history stores coordinates in 16-bit form, so virtual-desktop
-  coordinates are limited to ±32767; layouts wider/taller than 32768 px can mis-track
-  (a rare, multi-8K-monitor edge case)
+见 [`docs/limitations.md`](docs/limitations.md)。简要来说：设备丢失后需要几帧才能重建
+完成；看门狗无法对抗排在叠加层之上的窗口；单线程设计下 `DwmFlush` 一旦阻塞会连带卡住
+消息循环；混合 DPI 的多显示器环境下尾迹坐标可能偏移，等等。

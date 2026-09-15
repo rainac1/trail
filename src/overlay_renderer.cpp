@@ -13,6 +13,14 @@ void LogHr(const wchar_t* step, HRESULT hr) {
   DiagLog(L"[OverlayRenderer] %ls failed: 0x%08X", step, static_cast<unsigned>(hr));
 }
 
+// 设备丢失类错误：D3D 设备被移除/复位/挂起、D2D 目标需要重建。这些错误下旧的
+// 设备、swapchain 与 DComp 视觉树全部失效，只能整栈重建（见头文件说明）。
+bool IsDeviceLost(HRESULT hr) {
+  return hr == D2DERR_RECREATE_TARGET || hr == DXGI_ERROR_DEVICE_REMOVED ||
+         hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG ||
+         hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+
 // 收集会话/合成器/GPU 诊断信息，帮助远程定位初始化失败原因。
 void LogSystemDiagnostics(ID3D11Device* device) {
   BOOL dwm = FALSE;
@@ -49,6 +57,7 @@ void LogSystemDiagnostics(ID3D11Device* device) {
 }  // namespace
 
 bool OverlayRenderer::Initialize(HWND hwnd, int width, int height) {
+  Shutdown();  // 可直接用于重建：先释放上一次创建的全部对象
   LogSystemDiagnostics(nullptr);
 
   HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1),
@@ -125,7 +134,7 @@ bool OverlayRenderer::Initialize(HWND hwnd, int width, int height) {
   if (SUCCEEDED(swapChain_.As(&sc2))) sc2->SetMaximumFrameLatency(1);
 
   // D2D 渲染目标：自建 premultiplied 离屏位图（不直接绑定 swapchain backbuffer，
-  // 该显示栈对 CreateBitmapFromDxgiSurface + flip backbuffer 一律 E_INVALIDARG）。
+  // 部分显示栈上 CreateBitmapFromDxgiSurface + flip backbuffer 会返回 E_INVALIDARG）。
   std::vector<uint8_t> zeros(static_cast<size_t>(width) * height * 4, 0);
   D2D1_BITMAP_PROPERTIES1 bp{};
   bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -171,19 +180,65 @@ bool OverlayRenderer::Initialize(HWND hwnd, int width, int height) {
     return false;
   }
 
+  lastFrameBox_ = D2D1_RECT_F{};
+  hasLastFrameBox_ = false;
+  loggedFailure_ = false;
+  initialized_ = true;
+
   DiagLog(L"[OverlayRenderer] initialized: %d x %d, DirectComposition + offscreen blit", width,
           height);
   return true;
 }
 
 void OverlayRenderer::Shutdown() {
-  if (ctx_) ctx_->SetTarget(nullptr);
+  // 释放顺序：先解绑渲染目标与视觉树内容，再自内向外销毁（内容 -> 目标 ->
+  // DComp 设备 -> swapchain -> D2D -> DXGI/D3D），避免 DWM 仍引用已释放的交换链。
+  if (ctx_) {
+    ctx_->SetTarget(nullptr);
+    ctx_->Flush();
+  }
+  offscreen_.Reset();
+  if (dcompVisual_) dcompVisual_->SetContent(nullptr);
+  if (dcompTarget_) dcompTarget_->SetRoot(nullptr);
+  if (dcompDevice_) dcompDevice_->Commit();  // 尽力而为：失败无需处理
+  dcompVisual_.Reset();
+  dcompTarget_.Reset();
+  dcompDevice_.Reset();
+  swapChain_.Reset();
+  d2dDevice_.Reset();
+  ctx_.Reset();
+  d2dFactory_.Reset();
+  dxgiFactory_.Reset();
+  d3dCtx_.Reset();
+  d3dDevice_.Reset();
+
+  hasLastFrameBox_ = false;
+  initialized_ = false;
 }
 
-bool OverlayRenderer::RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY,
-                                  const Sample* samples, uint32_t count, int originX, int originY,
-                                  bool waitForVBlank, bool drawLiveHead) {
-  if (!ctx_) return false;
+void OverlayRenderer::LogFailureOnce(const wchar_t* step, HRESULT hr) {
+  if (loggedFailure_) return;
+  loggedFailure_ = true;
+  DiagLog(L"[OverlayRenderer] %ls failed: 0x%08X (further identical failures suppressed)", step,
+          static_cast<unsigned>(hr));
+}
+
+bool OverlayRenderer::DeviceValid() {
+  if (!initialized_ || !dcompDevice_) return false;
+  BOOL valid = FALSE;
+  const HRESULT hr = dcompDevice_->CheckDeviceState(&valid);
+  if (FAILED(hr) || !valid) {
+    DiagLog(L"[OverlayRenderer] CheckDeviceState: invalid (hr=0x%08X, valid=%d)",
+            static_cast<unsigned>(hr), static_cast<int>(valid));
+    return false;
+  }
+  return true;
+}
+
+OverlayRenderer::FrameResult OverlayRenderer::RenderFrame(
+    ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY, const Sample* samples,
+    uint32_t count, int originX, int originY, bool waitForVBlank, bool drawLiveHead) {
+  if (!initialized_ || !ctx_) return FrameResult::RecreateDevice;
 
   const D2D1_RECT_F src{0.0f, 0.0f, static_cast<FLOAT>(texW), static_cast<FLOAT>(texH)};
   // 屏幕坐标 -> 窗口客户区坐标（窗口左上角 = 虚拟屏幕原点）。
@@ -219,7 +274,14 @@ bool OverlayRenderer::RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, in
     }
   }
   HRESULT hr = ctx_->EndDraw();
-  if (hr == D2DERR_RECREATE_TARGET) return false;  // 设备丢失（未做重建，见 README）
+  if (IsDeviceLost(hr)) {
+    LogHr(L"EndDraw (device lost)", hr);
+    return FrameResult::RecreateDevice;
+  }
+  if (FAILED(hr)) {
+    LogFailureOnce(L"EndDraw", hr);
+    return FrameResult::Failed;
+  }
 
   // ---- pass 2：实时头部点（提交前最后一刻采样，最小化头部延迟）----
   // 用 GetCursorInfo（替代 GetCursorPos）在历史点 EndDraw 之后、CopyResource 之前
@@ -231,7 +293,14 @@ bool OverlayRenderer::RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, in
       ctx_->BeginDraw();
       ctx_->DrawBitmap(cursorBmp, dst, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
       hr = ctx_->EndDraw();
-      if (hr == D2DERR_RECREATE_TARGET) return false;
+      if (IsDeviceLost(hr)) {
+        LogHr(L"EndDraw (live head, device lost)", hr);
+        return FrameResult::RecreateDevice;
+      }
+      if (FAILED(hr)) {
+        LogFailureOnce(L"EndDraw (live head)", hr);
+        return FrameResult::Failed;
+      }
       extend(dst);
     }
   }
@@ -251,16 +320,38 @@ bool OverlayRenderer::RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, in
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backTex;
     Microsoft::WRL::ComPtr<IDXGISurface> offSurface;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> offTex;
-    if (SUCCEEDED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&backSurface))) &&
-        SUCCEEDED(backSurface.As(&backTex)) &&
-        SUCCEEDED(offscreen_->GetSurface(&offSurface)) &&
-        SUCCEEDED(offSurface.As(&offTex))) {
+    HRESULT cr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backSurface));
+    if (SUCCEEDED(cr)) cr = backSurface.As(&backTex);
+    if (SUCCEEDED(cr)) cr = offscreen_->GetSurface(&offSurface);
+    if (SUCCEEDED(cr)) cr = offSurface.As(&offTex);
+    if (SUCCEEDED(cr)) {
       d3dCtx_->CopyResource(backTex.Get(), offTex.Get());
+    } else {
+      // 拷贝路径失败时才向驱动查询设备移除原因（成功路径不做任何额外调用，热路径
+      // 每帧开销保持不变）；设备确实被移除则升级为整栈重建。
+      if (IsDeviceLost(cr) || IsDeviceLost(d3dDevice_->GetDeviceRemovedReason())) {
+        LogHr(L"copy offscreen -> backbuffer (device lost)", cr);
+        return FrameResult::RecreateDevice;
+      }
+      // 拷贝失败：本帧 backbuffer 内容是旧的（画面可能短暂停滞），设备仍可用，
+      // 不升级为重建，仅记录一次。
+      LogFailureOnce(L"copy offscreen -> backbuffer", cr);
+      return FrameResult::Failed;
     }
   }
 
   // Present(0)：不等待 vsync，由调用方在 vblank 前对齐提交，帧赶上当前 vsync
   // 显示（低延迟）；Present(1,0) 则由 DWM 等待下一 vsync（约多 1 帧延迟）。
   const HRESULT pr = swapChain_->Present(waitForVBlank ? 1 : 0, 0);
-  return SUCCEEDED(pr) || pr == DXGI_STATUS_OCCLUDED;
+  if (IsDeviceLost(pr)) {
+    LogHr(L"Present (device lost)", pr);
+    return FrameResult::RecreateDevice;
+  }
+  if (FAILED(pr)) {  // DXGI_STATUS_OCCLUDED 是成功码，不在此列
+    LogFailureOnce(L"Present", pr);
+    return FrameResult::Failed;
+  }
+
+  loggedFailure_ = false;  // 连续多帧成功后重新武装失败日志
+  return FrameResult::Ok;
 }

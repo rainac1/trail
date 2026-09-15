@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <share.h>
 
 namespace {
 // 日志状态。当前不变式：DiagLog/DiagFatal 仅由主线程调用（采样线程不写日志），
@@ -19,7 +20,9 @@ static void OpenLog() {
   wchar_t* slash = wcsrchr(g_logPath, L'\\');
   if (slash) wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - g_logPath),
                       L"trail.log");
-  _wfopen_s(&g_log, g_logPath, L"a, ccs=UTF-8");
+  // _SH_DENYWR：允许其他进程读取日志。用 _wfopen_s 的默认共享模式会独占文件，
+  // 导致"渲染消失"时无法在程序仍运行的情况下查看日志 —— 而杀掉进程就销毁了现场。
+  g_log = _wfsopen(g_logPath, L"a, ccs=UTF-8", _SH_DENYWR);
   if (g_log) {
     fwprintf(g_log, L"\n===== %ls =====\n", L"--- session ---");
     fflush(g_log);

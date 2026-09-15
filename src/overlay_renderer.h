@@ -6,6 +6,8 @@
 #include <d3d11.h>
 #include <dcomp.h>
 #include <dxgi1_2.h>
+#include <dxgi1_3.h>  // IDXGISwapChain2（SetMaximumFrameLatency）：MSVC 在 dxgi1_2.h 中
+                      // 声明，MinGW 放在 dxgi1_3.h；显式包含以兼容两套工具链。
 
 #include "mouse_history.h"
 
@@ -13,8 +15,8 @@
 //
 // 呈现路径：
 //   1. D2D 渲染到自建 premultiplied 离屏位图（CreateBitmap + D2D1_BITMAP_OPTIONS_TARGET）。
-//      不能直接绑定 flip-model swapchain backbuffer：部分显示栈（AMD 核显等）对
-//      CreateBitmapFromDxgiSurface + flip backbuffer 一律返回 E_INVALIDARG。
+//      不能直接绑定 flip-model swapchain backbuffer：部分显示栈上
+//      CreateBitmapFromDxgiSurface + flip backbuffer 会返回 E_INVALIDARG。
 //      离屏位图帧间内容保留，故每帧只清除上一帧绘制内容的 bbox（脏矩形清除），
 //      而非全屏 Clear，以降低高分辨率下的 GPU 开销。
 //   2. 每帧通过 GPU CopyResource 把离屏纹理拷贝到 composition swapchain backbuffer
@@ -22,11 +24,24 @@
 //   3. IDCompositionVisual::SetContent(swapchain) 由 DWM 按 premultiplied alpha 合成；
 //      低延迟路径用 Present(0)（vblank 前对齐），回退路径用 Present(1,0) 节流。
 //
-// 选择 DirectComposition 而非 flip+Hwnd 的原因：此类显示栈对 CreateSwapChainForHwnd
+// 选择 DirectComposition 而非 flip+Hwnd 的原因：部分显示栈对 CreateSwapChainForHwnd
 // + DXGI_ALPHA_MODE_PREMULTIPLIED 返回 DXGI_ERROR_INVALID_CALL，而
-// CreateSwapChainForComposition 完整支持 premultiplied alpha。
+// CreateSwapChainForComposition + 离屏拷贝在同样条件下可用，是更可靠的硬件透明路径。
+//
+// 设备丢失（DXGI_ERROR_DEVICE_REMOVED / D2DERR_RECREATE_TARGET 等）：本窗口没有
+// 任何 GDI 内容，可见像素 100% 来自 DWM 合成的 DComp 视觉树，因此设备一旦丢失，
+// 叠加层会整体变透明（"渲染突然消失"），且不会自愈。RenderFrame/DeviceValid 会把
+// 这种情况报为 FrameResult::RecreateDevice / false，调用方必须重建整套设备与内容
+// （官方 CheckDeviceState 文档要求：新的 DXGI + DirectComposition 设备，内容全部重建）。
 class OverlayRenderer {
  public:
+  // 单帧结果。
+  enum class FrameResult {
+    Ok,              // 正常
+    Failed,          // 普通失败（本帧内容可能不完整，但设备仍可用，可继续渲染）
+    RecreateDevice,  // 设备丢失：必须重建整套设备与内容才能恢复显示
+  };
+
   bool Initialize(HWND hwnd, int width, int height);
   void Shutdown();
 
@@ -36,13 +51,25 @@ class OverlayRenderer {
   // 最后一刻采样当前光标位置并单独绘制头部点 —— 替代 GetCursorPos，且把头部采样
   // 推迟到提交前最后一刻以压缩头部延迟。waitForVBlank=false 时 Present(0) 不等待
   // vsync（由调用方做 vblank 前对齐）；true 时 Present(1,0) 阻塞等 vsync。
-  bool RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY,
-                   const Sample* samples, uint32_t count, int originX, int originY,
-                   bool waitForVBlank, bool drawLiveHead);
+  FrameResult RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY,
+                          const Sample* samples, uint32_t count, int originX, int originY,
+                          bool waitForVBlank, bool drawLiveHead);
+
+  // DirectComposition 设备是否仍然有效。DirectComposition 在设备丢失时会向合成
+  // 其内容的窗口发送 WM_PAINT，应用应在 WM_PAINT 中调用本函数确认设备状态；
+  // 返回 false 表示必须重建（见类注释）。
+  bool DeviceValid();
 
   ID2D1DeviceContext* Context() const { return ctx_.Get(); }
 
+  // 初始化是否全部完成（未初始化或已 Shutdown 时为 false）。设备不可用时调用方
+  // 不得渲染：Context() 为 null，光标纹理抓取会解引用空指针。
+  bool ready() const { return initialized_; }
+
  private:
+  // 非设备丢失类的失败只记一次日志（否则会逐帧刷屏），成功一帧后重新武装。
+  void LogFailureOnce(const wchar_t* step, HRESULT hr);
+
   Microsoft::WRL::ComPtr<ID3D11Device> d3dDevice_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3dCtx_;
   Microsoft::WRL::ComPtr<IDXGIFactory2> dxgiFactory_;
@@ -54,6 +81,9 @@ class OverlayRenderer {
   Microsoft::WRL::ComPtr<IDCompositionDevice> dcompDevice_;
   Microsoft::WRL::ComPtr<IDCompositionTarget> dcompTarget_;
   Microsoft::WRL::ComPtr<IDCompositionVisual> dcompVisual_;
+
+  bool initialized_ = false;
+  bool loggedFailure_ = false;
 
   // 脏矩形清除状态：offscreen_ 为 D2D1_BITMAP_OPTIONS_TARGET，帧间内容保留，
   // 故每帧只需清除上一帧绘制内容覆盖的区域（bbox），无需全屏 Clear。

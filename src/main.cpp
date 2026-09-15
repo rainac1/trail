@@ -33,6 +33,11 @@ CursorTexture g_cursorTex;  // 光标纹理缓存（形状变化时才重建）
 int g_originX = 0, g_originY = 0;  // 虚拟屏幕原点（窗口左上角）
 bool g_hideCursor = false;
 MouseHistoryTracker g_mouseHistory;  // 系统鼠标历史的增量读取状态
+// ---- 设备丢失 / 窗口健康状态（消息、渲染都在主线程，无需同步）----
+// 本窗口没有任何 GDI 内容，可见像素 100% 来自 DWM 合成的 DirectComposition 视觉树，
+// 因此 DXGI/DComp 设备一旦丢失，叠加层会整体变透明且不会自愈 —— 只能重建整套设备。
+bool g_deviceLost = false;      // 设备丢失（WM_PAINT 通知 / 帧循环检出 / 几何变化）
+bool g_displayChanged = false;  // 收到 WM_DISPLAYCHANGE
 // ---- 低延迟渲染：vblank 前对齐（Present(0) 赶上当前 vsync 显示）----
 struct VsyncState {
   uint64_t period = 0;    // 合成刷新周期（QPC ticks）
@@ -50,45 +55,55 @@ static uint64_t QpcNow() {
   return static_cast<uint64_t>(t.QuadPart);
 }
 
-// 用 DwmFlush（阻塞到合成刷新）自举校准刷新周期与相位。
-static bool CalibrateVsync(VsyncState& s) {
-  if (FAILED(DwmFlush())) return false;
-  uint64_t t0 = QpcNow();
-  if (FAILED(DwmFlush())) return false;
-  uint64_t t1 = QpcNow();
-  uint64_t total = t1 - t0;
-  for (int i = 0; i < 9; ++i) {
-    if (FAILED(DwmFlush())) return false;
-    const uint64_t t = QpcNow();
-    total += t - t1;
-    t1 = t;
+// 用 DwmFlush（阻塞到合成刷新）实测刷新周期与相位。失败返回 false 并记录原因
+// （DWM 不合成时 DwmFlush 会立即返回错误码，此时不能以它作为 vsync 基准）。
+static bool MeasureVsyncPeriod(int samples, uint64_t& outPeriod, uint64_t& outAnchor) {
+  HRESULT hr = DwmFlush();
+  if (FAILED(hr)) {
+    DiagLog(L"[vsync] DwmFlush failed: 0x%08X", static_cast<unsigned>(hr));
+    return false;
   }
-  const uint64_t period = total / 10;
+  uint64_t prev = QpcNow();
+  uint64_t total = 0;
+  for (int i = 0; i < samples; ++i) {
+    hr = DwmFlush();
+    if (FAILED(hr)) {
+      DiagLog(L"[vsync] DwmFlush failed: 0x%08X", static_cast<unsigned>(hr));
+      return false;
+    }
+    const uint64_t t = QpcNow();
+    total += t - prev;
+    prev = t;
+  }
+  outPeriod = total / static_cast<uint64_t>(samples);
+  outAnchor = prev;  // 最近一次合成刷新 ≈ vsync 相位
+  return true;
+}
+
+// 用 DwmFlush 自举校准刷新周期与相位。
+static bool CalibrateVsync(VsyncState& s) {
+  uint64_t period = 0, anchor = 0;
+  if (!MeasureVsyncPeriod(10, period, anchor)) return false;
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
   const double ms = static_cast<double>(period) * 1000.0 / static_cast<double>(freq.QuadPart);
-  if (ms < 3.0 || ms > 70.0) return false;  // 刷新率约 15Hz~333Hz 之外视为异常
+  if (ms < 3.0 || ms > 70.0) {  // 刷新率约 15Hz~333Hz 之外视为异常
+    DiagLog(L"[vsync] calibration rejected: %.2f ms per flush (DwmFlush not vsync-throttled?)",
+            ms);
+    return false;
+  }
   s.period = period;
-  s.anchor = t1;  // 最近一次合成刷新 ≈ vsync 相位
+  s.anchor = anchor;
   DiagLog(L"[vsync] calibrated refresh period: %.2f ms", ms);
   return true;
 }
 
 // 运行中重校准刷新周期（DwmFlush 实测，EMA 更新），应对 VRR/显示器切换等
 // 刷新率变化。每次约阻塞 4 个刷新周期（掉几帧），每 1500 帧一次可接受。
+// 实测失败时保留旧周期与旧相位（不清零），避免把对齐基准一次打坏。
 static void RefreshVsyncPeriod(VsyncState& s) {
-  if (FAILED(DwmFlush())) return;
-  uint64_t t0 = QpcNow();
-  if (FAILED(DwmFlush())) return;
-  uint64_t t1 = QpcNow();
-  uint64_t total = t1 - t0;
-  for (int i = 0; i < 3; ++i) {
-    if (FAILED(DwmFlush())) return;
-    const uint64_t t = QpcNow();
-    total += t - t1;
-    t1 = t;
-  }
-  const uint64_t newPeriod = total / 4;
+  uint64_t newPeriod = 0, anchor = 0;
+  if (!MeasureVsyncPeriod(4, newPeriod, anchor)) return;
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
   const double ms = static_cast<double>(newPeriod) * 1000.0 / static_cast<double>(freq.QuadPart);
@@ -102,7 +117,7 @@ static void RefreshVsyncPeriod(VsyncState& s) {
   s.period = (s.period * 7 + newPeriod) / 8;  // 慢 EMA，抑制抖动
   // 重新锚定相位到实测合成刷新（最后一次 DwmFlush 返回 ≈ 实际 vsync 相位）。
   // 仅更新周期而不重锚定的话，刷新率真实变化后旧相位基准会让显示持续晚一帧。
-  s.anchor = t1;
+  s.anchor = anchor;
 }
 
 // 忙等（分层等待）到 下一 vsync - leadMs，返回时渲染可赶上当前 vsync。
@@ -159,6 +174,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
     case WM_NCHITTEST:
       return HTTRANSPARENT;  // 点击穿透到下层窗口
+    case WM_PAINT:
+      // DirectComposition 在底层 DXGI 设备丢失时会向合成其内容的窗口发送 WM_PAINT
+      // （见 IDCompositionDevice::CheckDeviceState 文档）。此处确认设备状态，失效则
+      // 交由主循环重建整套设备与内容 —— 否则内容永久消失，只能重启进程。
+      ValidateRect(hwnd, nullptr);
+      if (g_renderer.ready() && !g_renderer.DeviceValid()) g_deviceLost = true;
+      return 0;
+    case WM_DISPLAYCHANGE:
+      // 分辨率/显示器拓扑变化：窗口几何与离屏位图尺寸都会失配，主循环里重新同步
+      // 并重建交换链。
+      g_displayChanged = true;
+      return 0;
     case WM_SETCURSOR:
       if (g_hideCursor) {
         SetCursor(nullptr);
@@ -179,7 +206,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-void RenderOneFrame(bool waitForVBlank) {
+OverlayRenderer::FrameResult RenderOneFrame(bool waitForVBlank) {
+  // 设备丢失/重建期间渲染器已释放，Context() 为空，此时不得进入渲染路径
+  // （光标纹理抓取会解引用空上下文）。
+  if (!g_renderer.ready()) return OverlayRenderer::FrameResult::RecreateDevice;
+
   // 光标纹理：仅当 hCursor 句柄变化时才重新抓取（游戏中光标形状几乎不变，
   // 该路径每帧仅一次 GetCursorInfo，开销约 1µs）。
   ID2D1Bitmap* cursorBmp = nullptr;
@@ -208,8 +239,51 @@ void RenderOneFrame(bool waitForVBlank) {
   const uint32_t n = static_cast<uint32_t>(
       CollectMouseHistory(pts, 512, g_mouseHistory, ci.ptScreenPos.x, ci.ptScreenPos.y));
 
-  g_renderer.RenderFrame(cursorBmp, texW, texH, hotX, hotY, pts, n, g_originX, g_originY,
-                         waitForVBlank, /*drawLiveHead=*/cursorBmp != nullptr);
+  return g_renderer.RenderFrame(cursorBmp, texW, texH, hotX, hotY, pts, n, g_originX, g_originY,
+                                waitForVBlank, /*drawLiveHead=*/cursorBmp != nullptr);
+}
+
+// 把窗口几何同步到当前虚拟屏幕。显示器热插拔 / 分辨率变化后窗口与离屏位图尺寸
+// 都会失配（新区域无内容、坐标错位）。返回 true 表示几何已变化（窗口已同步，调用
+// 方需按新尺寸重建渲染器）。
+bool SyncWindowGeometry(HWND hwnd, int& originX, int& originY, int& vw, int& vh) {
+  const int nx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int ny = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int nw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int nh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  if (nw <= 0 || nh <= 0) return false;
+  if (nx == originX && ny == originY && nw == vw && nh == vh) return false;
+  DiagLog(L"[watch] virtual screen %d,%d %dx%d -> %d,%d %dx%d, resizing overlay", originX, originY,
+          vw, vh, nx, ny, nw, nh);
+  originX = nx;
+  originY = ny;
+  vw = nw;
+  vh = nh;
+  SetWindowPos(hwnd, HWND_TOPMOST, nx, ny, nw, nh, SWP_NOACTIVATE | SWP_NOREDRAW);
+  return true;
+}
+
+// 顶层样式是叠加层可见的前提：窗口被压到其他窗口之下就等于渲染消失。仅在样式确实
+// 丢失时才重新置顶，避免周期性抢 z-order。
+void EnsureTopmost(HWND hwnd) {
+  if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) return;
+  DiagLog(L"[watch] WS_EX_TOPMOST lost -> re-asserting");
+  SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
+}
+
+// 重建整套渲染栈（设备丢失后进程内唯一的恢复途径）。成功返回 true。
+bool RecreateRenderer(HWND hwnd, int vw, int vh) {
+  DiagLog(L"[recover] recreating D3D/D2D/DComp stack (%d x %d)", vw, vh);
+  g_cursorTex.bitmap.Reset();  // 旧纹理由已销毁的 D2D 设备创建，必须重新抓取
+  g_cursorTex.handle = nullptr;
+  g_renderer.Shutdown();
+  if (!g_renderer.Initialize(hwnd, vw, vh)) {
+    DiagLog(L"[recover] re-initialize failed (will retry)");
+    return false;
+  }
+  DiagLog(L"[recover] renderer re-initialized");
+  return true;
 }
 
 }  // namespace
@@ -244,8 +318,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   // 覆盖整个虚拟桌面（含多显示器）。
   g_originX = GetSystemMetrics(SM_XVIRTUALSCREEN);
   g_originY = GetSystemMetrics(SM_YVIRTUALSCREEN);
-  const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-  const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);  // 非 const：运行中可能变化（见看门狗）
+  int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
   WNDCLASSEXW wc{};
   wc.cbSize = sizeof(wc);
@@ -320,6 +394,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
 
   MSG msg{};
   bool running = true;
+  uint64_t loopCount = 0;
+  // 重建失败的退避：以 QPC 计时而非帧计数（丢失期间不渲染，循环节奏与帧率无关），
+  // 从 500ms 起逐次加倍，成功后复位。
+  int recreateBackoffMs = 500;
+  uint64_t nextRecreateTicks = 0;  // 下次尝试重建的时刻（0 = 立即尝试）
   while (running) {
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
@@ -331,14 +410,62 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     }
     if (!running) break;
 
+    ++loopCount;
+
+    // ---- 周期性健康检查（≈每 2 秒 @120Hz）----
+    // 叠加层"渲染突然消失"的三条已知途径：窗口被压到非顶层、几何与虚拟屏幕失配、
+    // DComp 设备失效。这里逐项确认并纠正（几个 Get* 调用，开销可忽略）。
+    if (loopCount % 240 == 0) {
+      EnsureTopmost(hwnd);
+      if (SyncWindowGeometry(hwnd, g_originX, g_originY, vw, vh)) {
+        g_deviceLost = true;  // 尺寸变化：交换链与离屏位图必须按新尺寸重建
+      } else if (g_renderer.ready() && !g_renderer.DeviceValid()) {
+        g_deviceLost = true;
+      }
+    }
+    if (g_displayChanged) {
+      g_displayChanged = false;
+      if (SyncWindowGeometry(hwnd, g_originX, g_originY, vw, vh)) g_deviceLost = true;
+    }
+
+    // ---- 设备丢失恢复 ----
+    // 重建整套 D3D/D2D/DComp 设备与内容。重建失败时按 0.5s 起、逐次加倍（上限
+    // 15s）的时间退避重试 —— 驱动复位后设备可能短暂不可用；期间不渲染（渲染器已
+    // 释放，Context() 为空），也不让日志被重试失败刷屏。
+    if (g_deviceLost) {
+      const uint64_t nowTicks = QpcNow();
+      if (nextRecreateTicks != 0 && nowTicks < nextRecreateTicks) {
+        // 睡到下次重试（单片上限 50ms：既不做无谓空转，也保持消息循环/退出热键响应）
+        const uint64_t remainTicks = nextRecreateTicks - nowTicks;
+        DWORD ms = static_cast<DWORD>(remainTicks * 1000ULL / static_cast<uint64_t>(freq.QuadPart));
+        if (ms > 50) ms = 50;
+        Sleep(ms > 0 ? ms : 1);
+        continue;
+      }
+      if (RecreateRenderer(hwnd, vw, vh)) {
+        g_deviceLost = false;
+        nextRecreateTicks = 0;
+        recreateBackoffMs = 500;
+        // 设备丢失常伴随显示模式/刷新率变化，重新实测刷新周期并锚定 vsync 相位。
+        if (lowLatency) RefreshVsyncPeriod(g_vsync);
+      } else {
+        nextRecreateTicks =
+            nowTicks + static_cast<uint64_t>(recreateBackoffMs) *
+                           static_cast<uint64_t>(freq.QuadPart) / 1000ULL;
+        recreateBackoffMs = (recreateBackoffMs >= 8000) ? 15000 : recreateBackoffMs * 2;
+        continue;
+      }
+    }
+
     if (lowLatency) {
       const double periodMs =
           static_cast<double>(g_vsync.period) * 1000.0 / static_cast<double>(freq.QuadPart);
 
       const bool startedLate = WaitForVsyncAligned(g_vsync, budgetMs);
       const uint64_t t0 = QpcNow();
-      RenderOneFrame(false);
+      const OverlayRenderer::FrameResult fr = RenderOneFrame(false);
       const uint64_t t1 = QpcNow();
+      if (fr == OverlayRenderer::FrameResult::RecreateDevice) g_deviceLost = true;
       // 渲染耗时 EMA -> 自适应预算：EMA + 1.0ms 余量，限幅 [1, 8]ms（配合脏矩形
       // 清除与延迟采样，渲染更快，故下限/余量较旧值收紧，让 Present 更贴近 vsync）。
       const double renderMs =
@@ -365,7 +492,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
       }
       if (g_vsync.frameCount % 1500 == 0) RefreshVsyncPeriod(g_vsync);
     } else {
-      RenderOneFrame(true);  // Present(1,0)，vsync 阻塞节流
+      // Present(1,0)，vsync 阻塞节流。回退路径同样打存活心跳：日志停止增长 = 主
+      // 循环被阻塞（例如 DwmFlush 卡住），日志继续增长 = 循环正常、问题在合成/分层
+      // 侧 —— 这是"渲染消失"最直接的区分依据。
+      if (RenderOneFrame(true) == OverlayRenderer::FrameResult::RecreateDevice) {
+        g_deviceLost = true;
+      }
+      if (++g_vsync.frameCount % 3000 == 0) {
+        DiagLog(L"[frame] %llu frames rendered (Present(1,0) fallback)",
+                static_cast<unsigned long long>(g_vsync.frameCount));
+      }
     }
   }
   timeEndPeriod(1);
