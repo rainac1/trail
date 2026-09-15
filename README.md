@@ -20,7 +20,9 @@
 
 ### 前置要求
 
-- Windows 10/11（必须启用桌面合成 / DWM）
+- **Windows 10 1803+ / 11**（必须启用桌面合成 / DWM）。1803 是硬性下限：等待机制用的是
+  高分辨率可等待定时器（`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`），且本程序没有任何
+  降级回退，不满足前提会直接报错退出
 - **Visual Studio 2017+**，需安装“使用 C++ 的桌面开发”工作负载（MSVC 编译器、Windows
   SDK、Ninja）
 - **CMake 3.16+** 在 `PATH` 上（https://cmake.org 或 `winget install cmake`）

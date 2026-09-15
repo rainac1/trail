@@ -24,7 +24,10 @@ Detailed, durable notes live in `docs/`:
 
 ### Prerequisites
 
-- Windows 10/11 (desktop composition / DWM must be enabled)
+- **Windows 10 1803+ / 11** (desktop composition / DWM must be enabled). 1803 is a hard
+  floor: the waiting mechanism is a high-resolution waitable timer
+  (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) and there is no fallback path, so a missing
+  prerequisite is reported as an error and exits
 - **Visual Studio 2017+** with the "Desktop development with C++" workload
   (MSVC compiler, Windows SDK, Ninja)
 - **CMake 3.16+** on `PATH` (https://cmake.org or `winget install cmake`)
