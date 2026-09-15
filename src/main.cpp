@@ -1,7 +1,8 @@
 // 帧内鼠标尾迹全屏透明叠加层
 //
 // 线程模型：
-//   单线程 —— 窗口 + 消息循环 + 渲染（Present(1,0) 由 vsync 节流）。
+// 线程模型：
+//   单线程 —— 窗口 + 消息循环 + 渲染（Present(0)，由调用方按 DWM 合成时钟对齐）。
 //   无独立采样线程：渲染线程每帧唤醒时按需调用 GetMouseMovePointsEx，从系统
 //   自维护的 64 点鼠标移动历史中增量取回本帧轨迹。
 //
@@ -38,16 +39,37 @@ MouseHistoryTracker g_mouseHistory;  // 系统鼠标历史的增量读取状态
 // 因此 DXGI/DComp 设备一旦丢失，叠加层会整体变透明且不会自愈 —— 只能重建整套设备。
 bool g_deviceLost = false;      // 设备丢失（WM_PAINT 通知 / 帧循环检出 / 几何变化）
 bool g_displayChanged = false;  // 收到 WM_DISPLAYCHANGE
-// ---- 低延迟渲染：vblank 前对齐（Present(0) 赶上当前 vsync 显示）----
+// ---- 低延迟渲染：以 DWM 合成时钟为绝对时间基准（A+B，无采样、无回退）----
+//
+// 时间基准是 QueryPerformanceCounter；显示时钟不再靠 DwmFlush 采样，而是直接读
+// DwmGetCompositionTimingInfo：
+//   qpcRefreshPeriod = 刷新周期（QPC ticks）
+//   qpcCompose       = 最近一次合成时刻（QPC）—— 以它作为相位栅格，因为要"赶在
+//                      某次合成之前把帧交上去"；vblank 时刻比合成时刻晚一个固定
+//                      相位（qpcVBlank - qpcCompose），该偏移由唤醒提前量 lead 覆盖
+//   qpcVBlank / gpcCompose 栅格每帧重读，因此不存在自由推进的累积漂移
+//
+// 由此可以删掉：启动 11 次阻塞采样、每 1500 帧 5 次阻塞重测（会周期性掉帧）、
+// 周期 EMA、相位预测，以及 timeBeginPeriod(1) + Sleep(1) 轮询 + 2ms 忙等。
+// 读不到合成时钟或高分辨率定时器不可用即报错退出：本程序不做降级回退。
 struct VsyncState {
-  uint64_t period = 0;    // 合成刷新周期（QPC ticks）
-  uint64_t anchor = 0;    // 目标 vsync 相位（QPC 域）
-  double emaRenderMs = 3.0;  // 渲染耗时 EMA，用于自适应预算
+  uint64_t period = 0;       // 合成刷新周期（QPC ticks）
+  uint64_t deadline = 0;     // 本帧瞄准的合成时刻（QPC）
+  double emaRenderMs = 3.0;  // 渲染耗时 EMA -> 唤醒提前量
   uint64_t frameCount = 0;
-  uint64_t missed = 0;    // 渲染超时错过目标 vsync 的次数
+  uint64_t missed = 0;       // 渲染在目标合成时刻之后才完成的次数
+  // 每 3000 帧汇总一次的诊断量（用于调 lead：唤醒是否偏晚、渲染完成后余量是否够）
+  uint64_t wakeSum = 0;      // t0 - target 之和（唤醒落后于 target 的量）
+  uint64_t wakeMax = 0;
+  int64_t slackSum = 0;      // deadline - t1 之和（正 = 赶在目标合成之前完成）
+  int64_t slackMin = 0;
+  uint64_t clockReadSum = 0;  // DwmGetCompositionTimingInfo 调用耗时（每帧一次查询）
+  uint64_t clockReadMax = 0;
 };
-// 主线程独占的 vsync 校准/对齐状态（含刷新周期，供低延迟渲染对齐）。
 static VsyncState g_vsync;
+static uint64_t g_qpcFreq = 0;    // 缓存的 QPC 频率（每帧换算都要用）
+static HANDLE g_timer = nullptr;  // 高分辨率可等待定时器（B）
+static HRESULT g_clockError = S_OK;  // 时钟/定时器失败原因（用于退出时报告）
 
 static uint64_t QpcNow() {
   LARGE_INTEGER t;
@@ -55,110 +77,146 @@ static uint64_t QpcNow() {
   return static_cast<uint64_t>(t.QuadPart);
 }
 
-// 用 DwmFlush（阻塞到合成刷新）实测刷新周期与相位。失败返回 false 并记录原因
-// （DWM 不合成时 DwmFlush 会立即返回错误码，此时不能以它作为 vsync 基准）。
-static bool MeasureVsyncPeriod(int samples, uint64_t& outPeriod, uint64_t& outAnchor) {
-  HRESULT hr = DwmFlush();
+static uint64_t MsToTicks(double ms) {
+  return static_cast<uint64_t>(ms * static_cast<double>(g_qpcFreq) / 1000.0);
+}
+
+static double TicksToMs(uint64_t ticks) {
+  return static_cast<double>(ticks) * 1000.0 / static_cast<double>(g_qpcFreq);
+}
+
+static double TicksToUs(uint64_t ticks) {
+  return static_cast<double>(ticks) * 1000000.0 / static_cast<double>(g_qpcFreq);
+}
+
+static double TicksToUsI(int64_t ticks) {
+  return static_cast<double>(ticks) * 1000000.0 / static_cast<double>(g_qpcFreq);
+}
+
+// A：读一次 DWM 合成时钟。字段不合法（含未初始化）一律视为失败，由调用方报错。
+static bool ReadCompositionClock(DWM_TIMING_INFO& out) {
+  out = DWM_TIMING_INFO{};
+  out.cbSize = sizeof(out);
+  const HRESULT hr = DwmGetCompositionTimingInfo(nullptr, &out);
   if (FAILED(hr)) {
-    DiagLog(L"[vsync] DwmFlush failed: 0x%08X", static_cast<unsigned>(hr));
+    g_clockError = hr;
     return false;
   }
-  uint64_t prev = QpcNow();
-  uint64_t total = 0;
-  for (int i = 0; i < samples; ++i) {
-    hr = DwmFlush();
-    if (FAILED(hr)) {
-      DiagLog(L"[vsync] DwmFlush failed: 0x%08X", static_cast<unsigned>(hr));
+  if (out.qpcRefreshPeriod == 0 || out.qpcCompose == 0) {
+    g_clockError = E_UNEXPECTED;
+    return false;
+  }
+  return true;
+}
+
+// 建立时间基础设施：缓存 QPC 频率、校验合成时钟、创建高分辨率可等待定时器。
+// 失败返回 false 并把退出原因写入 message。
+static bool InitTiming(wchar_t* message, size_t messageCount) {
+  LARGE_INTEGER freq{};
+  if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0) {
+    swprintf_s(message, messageCount, L"QueryPerformanceFrequency 失败。\n\n诊断日志: %ls",
+               DiagLogPath());
+    return false;
+  }
+  g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
+
+  DWM_TIMING_INFO ti{};
+  if (!ReadCompositionClock(ti)) {
+    swprintf_s(message, messageCount,
+               L"无法读取 DWM 合成时钟（DwmGetCompositionTimingInfo 失败，HRESULT=0x%08X）。\n"
+               L"本程序以该时钟为唯一时间基准，不做降级回退。\n"
+               L"（桌面合成 / DWM 未启用时会出现这种情况。）\n\n诊断日志: %ls",
+               static_cast<unsigned>(g_clockError), DiagLogPath());
+    return false;
+  }
+  const double periodMs = TicksToMs(ti.qpcRefreshPeriod);
+  if (periodMs < 0.5 || periodMs > 500.0) {  // 2Hz~2000Hz 之外视为异常值
+    g_clockError = E_UNEXPECTED;
+    swprintf_s(message, messageCount,
+               L"DWM 合成时钟给出的刷新周期异常（%.3f ms），拒绝作为时间基准。\n"
+               L"本程序不做降级回退。\n\n诊断日志: %ls",
+               periodMs, DiagLogPath());
+    return false;
+  }
+  g_vsync.period = ti.qpcRefreshPeriod;
+  // qpcVBlank-now 的正负可判断栅格语义：为正说明是"即将到来的"那次合成（本机实测
+  // qpcVBlank == qpcCompose 且为正值），为负则是"刚过去的"那次。
+  DiagLog(L"[clock] DWM composition clock: period=%.3f ms (rateRefresh=%u/%u), "
+          L"qpcVBlank-qpcCompose=%.3f ms, qpcVBlank-now=%+.3f ms",
+          periodMs, ti.rateRefresh.uiNumerator, ti.rateRefresh.uiDenominator,
+          TicksToMs(ti.qpcVBlank - ti.qpcCompose),
+          static_cast<double>(static_cast<int64_t>(ti.qpcVBlank) - static_cast<int64_t>(QpcNow())) *
+              1000.0 / static_cast<double>(g_qpcFreq));
+
+  // B：高分辨率可等待定时器（Windows 10 1803+）。它替代了 timeBeginPeriod(1)：
+  // 后者改的是全系统定时器分辨率，且 Sleep 精度只有 ~1ms、过冲可达 1.5ms。
+  g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                   TIMER_ALL_ACCESS);
+  if (!g_timer) {
+    const DWORD err = GetLastError();
+    g_clockError = HRESULT_FROM_WIN32(err);
+    swprintf_s(message, messageCount,
+               L"高分辨率可等待定时器创建失败（error=%lu），需要 Windows 10 1803+。\n"
+               L"本程序不做降级回退（不会退回 Sleep 轮询）。\n\n诊断日志: %ls",
+               err, DiagLogPath());
+    return false;
+  }
+  return true;
+}
+
+// 推出本帧的等待目标：把绝对合成栅格 qpcCompose + k*period 推进到"提前 lead 之后
+// 仍在未来"的最近一格，使渲染恰好在这次合成之前完成提交。
+//
+// 必须要求 next - lead > now（而不是 next > now）：DWM 报出的合成/vblank 时刻可能是
+// *即将到来* 的那一次（实测 qpcVBlank == qpcCompose），若只要求 next > now，那么当
+// now 落在 (next-lead, next) 区间时目标会落在过去，于是同一格里连续空转 —— 实测会
+// 退化到约 4.7 次渲染/显示帧。按尾迹语义（每次渲染消费一次鼠标历史水印），这会让
+// 屏幕上的尾迹只有应有的约 1/4 长，所以必须保证每格恰好渲染一次。
+// 起步已晚（目标在过去）时本函数仍会给出未来目标，不再"立即追赶"：错过一格后立即
+// 渲染并不会让画面提前，只会白丢掉一段采样。
+static bool NextFrameTarget(double leadMs, uint64_t& outTarget) {
+  DWM_TIMING_INFO ti{};
+  if (!ReadCompositionClock(ti)) return false;
+  g_vsync.period = ti.qpcRefreshPeriod;
+  const uint64_t period = ti.qpcRefreshPeriod;
+  const uint64_t now = QpcNow();
+  const uint64_t lead = MsToTicks(leadMs);
+  uint64_t next = ti.qpcCompose;
+  const uint64_t earliest = now + lead;  // 目标(target)必须严格晚于 now
+  if (next <= earliest) next += period * ((earliest - next) / period + 1);
+  g_vsync.deadline = next;
+  outTarget = next - lead;
+  return true;
+}
+
+// B：等到 target。粗睡用高分辨率可等待定时器（相对时间），最后 spinMs 交给自旋，
+// 用极短的忙等吸收定时器唤醒抖动。自旋窗口从原先的 2ms 缩到 0.5ms。
+//
+// 单片上限 sliceMs：单次长睡（例如 7ms）会让 CPU 进入较深空闲状态，唤醒延迟偶发
+// 达到 4~7ms（实测 wake max），足以吃掉 lead 的余量而错过一次合成。切成 ≤2ms 的片
+// 可显著降低这种长尾（旧方案靠 timeBeginPeriod(1) 每毫秒醒一次恰好避开了它）。
+static bool WaitUntil(uint64_t target) {
+  const uint64_t spinTicks = MsToTicks(0.5);
+  const uint64_t sliceTicks = MsToTicks(2.0);
+  for (;;) {
+    const uint64_t now = QpcNow();
+    if (now >= target) return true;
+    const uint64_t remain = target - now;
+    if (remain <= spinTicks) {
+      YieldProcessor();
+      continue;
+    }
+    uint64_t sleepTicks = remain - spinTicks;
+    if (sleepTicks > sliceTicks) sleepTicks = sliceTicks;
+    LARGE_INTEGER due;
+    due.QuadPart = -static_cast<LONGLONG>(sleepTicks * 10000000ULL / g_qpcFreq);
+    if (due.QuadPart >= 0) due.QuadPart = -1;  // 负数 = 相对时间（100ns 单位）
+    if (!SetWaitableTimerEx(g_timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+      g_clockError = HRESULT_FROM_WIN32(GetLastError());
       return false;
     }
-    const uint64_t t = QpcNow();
-    total += t - prev;
-    prev = t;
+    WaitForSingleObject(g_timer, INFINITE);
   }
-  outPeriod = total / static_cast<uint64_t>(samples);
-  outAnchor = prev;  // 最近一次合成刷新 ≈ vsync 相位
-  return true;
-}
-
-// 用 DwmFlush 自举校准刷新周期与相位。
-static bool CalibrateVsync(VsyncState& s) {
-  uint64_t period = 0, anchor = 0;
-  if (!MeasureVsyncPeriod(10, period, anchor)) return false;
-  LARGE_INTEGER freq;
-  QueryPerformanceFrequency(&freq);
-  const double ms = static_cast<double>(period) * 1000.0 / static_cast<double>(freq.QuadPart);
-  if (ms < 3.0 || ms > 70.0) {  // 刷新率约 15Hz~333Hz 之外视为异常
-    DiagLog(L"[vsync] calibration rejected: %.2f ms per flush (DwmFlush not vsync-throttled?)",
-            ms);
-    return false;
-  }
-  s.period = period;
-  s.anchor = anchor;
-  DiagLog(L"[vsync] calibrated refresh period: %.2f ms", ms);
-  return true;
-}
-
-// 运行中重校准刷新周期（DwmFlush 实测，EMA 更新），应对 VRR/显示器切换等
-// 刷新率变化。每次约阻塞 4 个刷新周期（掉几帧），每 1500 帧一次可接受。
-// 实测失败时保留旧周期与旧相位（不清零），避免把对齐基准一次打坏。
-static void RefreshVsyncPeriod(VsyncState& s) {
-  uint64_t newPeriod = 0, anchor = 0;
-  if (!MeasureVsyncPeriod(4, newPeriod, anchor)) return;
-  LARGE_INTEGER freq;
-  QueryPerformanceFrequency(&freq);
-  const double ms = static_cast<double>(newPeriod) * 1000.0 / static_cast<double>(freq.QuadPart);
-  if (ms < 3.0 || ms > 70.0) return;
-  if (newPeriod != s.period) {
-    const double oldMs = static_cast<double>(s.period) * 1000.0 / static_cast<double>(freq.QuadPart);
-    if (oldMs > 0 && (ms / oldMs > 1.05 || ms / oldMs < 0.95)) {
-      DiagLog(L"[vsync] refresh period changed: %.2f ms -> %.2f ms", oldMs, ms);
-    }
-  }
-  s.period = (s.period * 7 + newPeriod) / 8;  // 慢 EMA，抑制抖动
-  // 重新锚定相位到实测合成刷新（最后一次 DwmFlush 返回 ≈ 实际 vsync 相位）。
-  // 仅更新周期而不重锚定的话，刷新率真实变化后旧相位基准会让显示持续晚一帧。
-  s.anchor = anchor;
-}
-
-// 忙等（分层等待）到 下一 vsync - leadMs，返回时渲染可赶上当前 vsync。
-// leadMs 是唤醒提前量（渲染预算）。返回 true 表示起步时已
-// 错过目标 vsync（上一帧渲染超时，或首帧），本帧不等待、立即渲染追赶。唤醒分
-// 两段：远离 target 用 Sleep(1) 粗睡省 CPU，进入最后 spinMargin（2ms）纯忙等
-// （YieldProcessor）精确对齐到 target —— 忙等缓冲足够吸收 Sleep(1) 在
-// timeBeginPeriod(1) 下的过冲（约 ≤1.5ms），保证唤醒点精确落在 target、既不睡
-// 过头（睡过头会压缩渲染预算、增加错过 vsync 的概率）也不提前太多。
-static bool WaitForVsyncAligned(VsyncState& s, double leadMs) {
-  LARGE_INTEGER freq;
-  QueryPerformanceFrequency(&freq);
-  const uint64_t lead =
-      static_cast<uint64_t>(leadMs * static_cast<double>(freq.QuadPart) / 1000.0);
-  const uint64_t now = QpcNow();
-
-  // 已错过目标 vsync：不空等、立即渲染追赶，避免空等把"漏一帧"放大成
-  // "帧间隔翻倍"——否则下一帧会一次性画出更长时间窗口内积累的轨迹，尾迹被
-  // 拉长。仍把相位推进到未来最近的同相位 vsync，供下一帧重新对齐节奏。
-  if (now >= s.anchor) {
-    s.anchor = s.anchor + s.period * ((now - s.anchor) / s.period + 1);
-    return true;
-  }
-
-  // 锚点未到（上一帧提前完成）：本帧只能排到 anchor + period（DWM 一帧
-  // 占一个 vsync 槽），若复用当前 anchor 会导致渲染逐帧逼近 vsync 直至错过。
-  s.anchor = s.anchor + s.period;
-  const uint64_t target = s.anchor - lead;
-  const uint64_t spinMargin =
-      static_cast<uint64_t>(2.0 * static_cast<double>(freq.QuadPart) / 1000.0);
-  for (;;) {
-    const uint64_t t = QpcNow();
-    if (t >= target) break;
-    const uint64_t remain = target - t;
-    if (remain > spinMargin) {
-      Sleep(1);  // 还远：粗睡省 CPU
-    } else {
-      YieldProcessor();  // 最后 2ms：纯忙等，降低自旋功耗与总线争用
-    }
-  }
-  return false;
 }
 
 void PrintUsage() {
@@ -206,7 +264,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-OverlayRenderer::FrameResult RenderOneFrame(bool waitForVBlank) {
+OverlayRenderer::FrameResult RenderOneFrame() {
   // 设备丢失/重建期间渲染器已释放，Context() 为空，此时不得进入渲染路径
   // （光标纹理抓取会解引用空上下文）。
   if (!g_renderer.ready()) return OverlayRenderer::FrameResult::RecreateDevice;
@@ -240,7 +298,7 @@ OverlayRenderer::FrameResult RenderOneFrame(bool waitForVBlank) {
       CollectMouseHistory(pts, 512, g_mouseHistory, ci.ptScreenPos.x, ci.ptScreenPos.y));
 
   return g_renderer.RenderFrame(cursorBmp, texW, texH, hotX, hotY, pts, n, g_originX, g_originY,
-                                waitForVBlank, /*drawLiveHead=*/cursorBmp != nullptr);
+                                /*drawLiveHead=*/cursorBmp != nullptr);
 }
 
 // 把窗口几何同步到当前虚拟屏幕。显示器热插拔 / 分辨率变化后窗口与离屏位图尺寸
@@ -377,28 +435,33 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   RegisterHotKey(hwnd, kQuitHotkeyId, MOD_CONTROL | MOD_ALT, 'Q');
 
   // 主循环：消息 + 低延迟渲染。
-  // 默认模式：DwmFlush 校准 vsync 相位，忙等到 vblank 前 budget 毫秒开始渲染，
-  // Present(0) 让帧赶上当前 vsync 显示 —— 尾迹头延迟从约 1 帧压缩到渲染预算量级。
-  // 校准失败（无 DWM 合成）时回退 Present(1,0) 阻塞等 vsync。
-  const bool lowLatency = CalibrateVsync(g_vsync);
-  if (!lowLatency) DiagLog(L"[main] vsync calibration failed, falling back to Present(1,0)");
+  // 时间基准 = QPC，显示时钟直接读 DWM 合成时钟（A），粗睡用高分辨率可等待定时器
+  // 加短自旋（B）。二者缺一即报错退出 —— 本程序不做降级回退（没有 Present(1,0)
+  // 之类的备用呈现方式，也没有 Sleep 轮询备用等待方式）。
+  wchar_t timingError[640] = {};
+  if (!InitTiming(timingError, ARRAYSIZE(timingError))) {
+    DiagFatal(L"Trail", timingError);
+    UnregisterHotKey(hwnd, kQuitHotkeyId);
+    g_renderer.Shutdown();
+    DestroyWindow(hwnd);
+    DiagClose();
+    return 1;
+  }
   double budgetMs = 2.0;
-  LARGE_INTEGER freq;
-  QueryPerformanceFrequency(&freq);
-  // 提升定时器分辨率，使低延迟等待里的 Sleep(1) 接近 1ms；退出时恢复。
-  timeBeginPeriod(1);
-  // 提升渲染线程（主线程）优先级：低延迟 vsync 对齐对调度抖动敏感，普通优先级
-  // 下忙等/渲染易被抢占导致错过 vsync。用 HIGHEST 而非 TIME_CRITICAL，避免抢占
-  // DWM / 游戏线程。退出时恢复。
+  // 提升渲染线程（主线程）优先级：截止时刻对齐对调度抖动敏感，普通优先级下渲染易被
+  // 抢占而错过目标合成。用 HIGHEST 而非 TIME_CRITICAL，避免抢占 DWM / 游戏线程。
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
   MSG msg{};
   bool running = true;
+  int exitCode = 0;
+  wchar_t fatalError[640] = {};
   uint64_t loopCount = 0;
   // 重建失败的退避：以 QPC 计时而非帧计数（丢失期间不渲染，循环节奏与帧率无关），
   // 从 500ms 起逐次加倍，成功后复位。
   int recreateBackoffMs = 500;
   uint64_t nextRecreateTicks = 0;  // 下次尝试重建的时刻（0 = 立即尝试）
+  uint64_t lastStatTicks = QpcNow();  // 上次打统计行的时刻（用于算 fps）
   while (running) {
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
@@ -437,7 +500,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
       if (nextRecreateTicks != 0 && nowTicks < nextRecreateTicks) {
         // 睡到下次重试（单片上限 50ms：既不做无谓空转，也保持消息循环/退出热键响应）
         const uint64_t remainTicks = nextRecreateTicks - nowTicks;
-        DWORD ms = static_cast<DWORD>(remainTicks * 1000ULL / static_cast<uint64_t>(freq.QuadPart));
+        DWORD ms = static_cast<DWORD>(remainTicks * 1000ULL / g_qpcFreq);
         if (ms > 50) ms = 50;
         Sleep(ms > 0 ? ms : 1);
         continue;
@@ -446,72 +509,110 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
         g_deviceLost = false;
         nextRecreateTicks = 0;
         recreateBackoffMs = 500;
-        // 设备丢失常伴随显示模式/刷新率变化，重新实测刷新周期并锚定 vsync 相位。
-        if (lowLatency) RefreshVsyncPeriod(g_vsync);
+        // 无需重测 vsync：合成时钟每帧都会重读（NextFrameTarget），显示模式/刷新率
+        // 变化会在下一帧自动反映出来。
       } else {
-        nextRecreateTicks =
-            nowTicks + static_cast<uint64_t>(recreateBackoffMs) *
-                           static_cast<uint64_t>(freq.QuadPart) / 1000ULL;
+        nextRecreateTicks = nowTicks + static_cast<uint64_t>(recreateBackoffMs) * g_qpcFreq / 1000ULL;
         recreateBackoffMs = (recreateBackoffMs >= 8000) ? 15000 : recreateBackoffMs * 2;
         continue;
       }
     }
 
-    if (lowLatency) {
-      const double periodMs =
-          static_cast<double>(g_vsync.period) * 1000.0 / static_cast<double>(freq.QuadPart);
+    // ---- 算出本帧的截止时刻并等到它 ----
+    // 时钟读不到、或定时器等待失败：不降级、不空转，直接报错结束进程。
+    uint64_t target = 0;
+    const uint64_t tClock0 = QpcNow();
+    const bool haveTarget = NextFrameTarget(budgetMs, target);
+    const uint64_t tClock1 = QpcNow();
+    g_vsync.clockReadSum += tClock1 - tClock0;
+    if (tClock1 - tClock0 > g_vsync.clockReadMax) g_vsync.clockReadMax = tClock1 - tClock0;
+    if (!haveTarget) {
+      DiagLog(L"[clock] DwmGetCompositionTimingInfo failed at runtime: 0x%08X",
+              static_cast<unsigned>(g_clockError));
+      swprintf_s(fatalError, ARRAYSIZE(fatalError),
+                 L"运行时无法读取 DWM 合成时钟（HRESULT=0x%08X）。\n"
+                 L"本程序不做降级回退，已结束进程。\n\n诊断日志: %ls",
+                 static_cast<unsigned>(g_clockError), DiagLogPath());
+      exitCode = 1;
+      break;
+    }
+    if (!WaitUntil(target)) {
+      DiagLog(L"[clock] SetWaitableTimerEx failed at runtime: 0x%08X",
+              static_cast<unsigned>(g_clockError));
+      swprintf_s(fatalError, ARRAYSIZE(fatalError),
+                 L"高分辨率定时器等待失败（HRESULT=0x%08X）。\n"
+                 L"本程序不做降级回退，已结束进程。\n\n诊断日志: %ls",
+                 static_cast<unsigned>(g_clockError), DiagLogPath());
+      exitCode = 1;
+      break;
+    }
 
-      const bool startedLate = WaitForVsyncAligned(g_vsync, budgetMs);
-      const uint64_t t0 = QpcNow();
-      const OverlayRenderer::FrameResult fr = RenderOneFrame(false);
-      const uint64_t t1 = QpcNow();
-      if (fr == OverlayRenderer::FrameResult::RecreateDevice) g_deviceLost = true;
-      // 渲染耗时 EMA -> 自适应预算：EMA + 1.0ms 余量，限幅 [1, 8]ms（配合脏矩形
-      // 清除与延迟采样，渲染更快，故下限/余量较旧值收紧，让 Present 更贴近 vsync）。
-      const double renderMs =
-          static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(freq.QuadPart);
-      g_vsync.emaRenderMs = g_vsync.emaRenderMs * 0.9 + renderMs * 0.1;
-      budgetMs = g_vsync.emaRenderMs + 1.0;
-      if (budgetMs < 1.0) budgetMs = 1.0;
-      if (budgetMs > 8.0) budgetMs = 8.0;
-      const double budgetMax = periodMs * 0.6;
-      if (budgetMs > budgetMax) budgetMs = budgetMax;
-      ++g_vsync.frameCount;
+    const uint64_t t0 = QpcNow();
+    const OverlayRenderer::FrameResult fr = RenderOneFrame();
+    const uint64_t t1 = QpcNow();
+    if (fr == OverlayRenderer::FrameResult::RecreateDevice) g_deviceLost = true;
 
-      // 错过：起步就晚（startedLate），或渲染在目标 vsync 后才完成（t1 > anchor）。
-      if (startedLate || t1 > g_vsync.anchor) {
-        ++g_vsync.missed;
-      }
+    // 渲染耗时 EMA -> 唤醒提前量 lead：EMA + 1.0ms 余量，限幅 [1, 8]ms 且不超过
+    // 周期的 60%。余量吸收的是调度抖动与"合成时刻→vblank"的固定相位偏移
+    // （InitTiming 日志里的 qpcVBlank-qpcCompose），可按实测收紧。
+    const double renderMs = TicksToMs(t1 - t0);
+    g_vsync.emaRenderMs = g_vsync.emaRenderMs * 0.9 + renderMs * 0.1;
+    budgetMs = g_vsync.emaRenderMs + 1.0;
+    if (budgetMs < 1.0) budgetMs = 1.0;
+    if (budgetMs > 8.0) budgetMs = 8.0;
+    const double budgetMax = TicksToMs(g_vsync.period) * 0.6;
+    if (budgetMs > budgetMax) budgetMs = budgetMax;
+    ++g_vsync.frameCount;
 
-      if (g_vsync.frameCount % 3000 == 0) {
-        DiagLog(L"[vsync] frames=%llu missed=%llu (%.1f%%), render EMA=%.2f ms, budget=%.2f ms",
-                static_cast<unsigned long long>(g_vsync.frameCount),
-                static_cast<unsigned long long>(g_vsync.missed),
-                100.0 * static_cast<double>(g_vsync.missed) / g_vsync.frameCount,
-                g_vsync.emaRenderMs, budgetMs);
-      }
-      if (g_vsync.frameCount % 1500 == 0) RefreshVsyncPeriod(g_vsync);
-    } else {
-      // Present(1,0)，vsync 阻塞节流。回退路径同样打存活心跳：日志停止增长 = 主
-      // 循环被阻塞（例如 DwmFlush 卡住），日志继续增长 = 循环正常、问题在合成/分层
-      // 侧 —— 这是"渲染消失"最直接的区分依据。
-      if (RenderOneFrame(true) == OverlayRenderer::FrameResult::RecreateDevice) {
-        g_deviceLost = true;
-      }
-      if (++g_vsync.frameCount % 3000 == 0) {
-        DiagLog(L"[frame] %llu frames rendered (Present(1,0) fallback)",
-                static_cast<unsigned long long>(g_vsync.frameCount));
-      }
+    // 错过：渲染在目标合成时刻之后才完成（即这次合成没赶上）。唤醒比 target 晚几十
+    // 微秒不算错过 —— lead 里本来就留了余量，只要余量没被吃完就仍然赶得上。
+    if (t1 > g_vsync.deadline) ++g_vsync.missed;
+
+    // 诊断累计：唤醒落后 target 多少、渲染完成后距目标合成时刻还有多少余量。
+    {
+      const uint64_t wakeLate = t0 - target;
+      g_vsync.wakeSum += wakeLate;
+      if (wakeLate > g_vsync.wakeMax) g_vsync.wakeMax = wakeLate;
+      const int64_t slack = static_cast<int64_t>(g_vsync.deadline) - static_cast<int64_t>(t1);
+      g_vsync.slackSum += slack;
+      if (slack < g_vsync.slackMin) g_vsync.slackMin = slack;
+    }
+
+    if (g_vsync.frameCount % 3000 == 0) {
+      const double n = static_cast<double>(g_vsync.frameCount);
+      const uint64_t statNow = QpcNow();
+      const double statMs = TicksToMs(statNow - lastStatTicks);
+      lastStatTicks = statNow;
+      DiagLog(L"[clock] frames=%llu fps=%.1f missed=%llu (%.1f%%), render EMA=%.2f ms, "
+              L"lead=%.2f ms | wake mean=%.0f us max=%.0f us, slack mean=%.0f us min=%.0f us, "
+              L"clockRead mean=%.0f us max=%.0f us",
+              static_cast<unsigned long long>(g_vsync.frameCount), 3000.0 * 1000.0 / statMs,
+              static_cast<unsigned long long>(g_vsync.missed),
+              100.0 * static_cast<double>(g_vsync.missed) / n, g_vsync.emaRenderMs, budgetMs,
+              TicksToUs(g_vsync.wakeSum) / n, TicksToUs(g_vsync.wakeMax),
+              TicksToUsI(g_vsync.slackSum) / n, TicksToUsI(g_vsync.slackMin),
+              TicksToUs(g_vsync.clockReadSum) / n, TicksToUs(g_vsync.clockReadMax));
+      g_vsync.wakeSum = 0;
+      g_vsync.wakeMax = 0;
+      g_vsync.slackSum = 0;
+      g_vsync.slackMin = 0;
+      g_vsync.clockReadSum = 0;
+      g_vsync.clockReadMax = 0;
     }
   }
-  timeEndPeriod(1);
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+  if (g_timer) {
+    CloseHandle(g_timer);
+    g_timer = nullptr;
+  }
 
   // 清理
   UnregisterHotKey(hwnd, kQuitHotkeyId);
   g_cursorTex.bitmap.Reset();
   g_renderer.Shutdown();
   DestroyWindow(hwnd);
+  // 运行时失败在窗口销毁之后再报错，避免弹窗被顶层叠加层盖住。
+  if (exitCode != 0) DiagFatal(L"Trail", fatalError);
   DiagClose();
-  return 0;
+  return exitCode;
 }

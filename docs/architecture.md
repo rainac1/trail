@@ -106,50 +106,77 @@ Details that matter:
   head) is remembered for the next frame's clear; a frame that draws nothing clears the
   previous bbox and remembers "nothing to clear".
 
-## Low-latency rendering (vblank-front alignment)
+## Low-latency rendering (absolute composition-clock deadline)
 
-Enabled by default. It compresses the head-vs-system-cursor latency from about one frame
-down to a few milliseconds:
+The goal is to submit each frame **just before the DWM composition that will display it**,
+so the head of the trail is only the render budget (a fraction of a millisecond) behind
+the system cursor instead of a full refresh period. Two mechanisms do all the work, and
+there is **no fallback path** — if either is unavailable the program reports the error and
+exits (see [limitations.md](limitations.md)).
 
-- **`DwmFlush` bootstrap calibration** measures the composition refresh period and the
-  vsync phase (≈ 8.3 ms @ 120 Hz, 16.7 ms @ 60 Hz). The measurement is rejected when it
-  is outside 3–70 ms, which is what happens when `DwmFlush` does not block at all
-  (see [diagnostics.md](diagnostics.md) for the toolchain pitfall that causes this).
-- **vblank-front alignment**: the loop sleeps (`Sleep(1)`) until ~2 ms before
-  `next_vsync - budget`, then busy-spins (`YieldProcessor`) for the last 2 ms so the
-  thread wakes *just before* the vsync deadline; `Present(0)` then lands the frame on
-  the *current* vsync instead of the next one (`Present(1,0)` waits half a frame or more
-  on average).
-- **No catch-up stall after a miss**: if the render starts after its target vsync the
-  loop renders immediately and re-anchors the phase instead of idling to the following
-  vsync, so a single miss does not stretch the next frame's interval into two periods
-  (which would pile two frames of trail into one frame).
+**A. Read the composition clock instead of sampling it.** `DwmGetCompositionTimingInfo(NULL, &ti)`
+returns the authoritative values directly, in QPC units:
+
+- `qpcRefreshPeriod` — the composition refresh period (e.g. ≈ 8.33 ms @ 120 Hz);
+- `qpcCompose` / `qpcVBlank` — the composition / vertical-blank timestamp on that lattice
+  (identical on the tested system, and reported as the *upcoming* one);
+- `rateRefresh` — the refresh rate as a ratio (diagnostics only).
+
+The deadline is therefore an **absolute lattice**: `next = qpcCompose + k·qpcRefreshPeriod`,
+advanced until `next − lead > now`, and the loop waits for `next − lead`. Because the
+lattice is re-derived from the clock every frame, phase error cannot accumulate. That
+replaces the whole earlier machinery — 11 blocking `DwmFlush` calls at startup, 5 more
+every 1500 frames (which dropped a handful of frames each time), a period EMA, and a
+free-running phase prediction that could drift for up to 1500 frames between re-anchors.
+
+The `lead` is the adaptive render budget: `render-time EMA + 1.0 ms`, clamped to [1, 8] ms
+and to 60 % of the period. Its margin absorbs scheduling jitter and the (possibly
+non-zero) offset between the composition and vertical-blank timestamps.
+
+**B. Wait with a high-resolution timer plus a short spin.** The coarse wait is
+`SetWaitableTimerEx` on a timer created with `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`
+(Windows 10 1803+), in ≤ 2 ms slices, and the final 0.5 ms is a `YieldProcessor` spin.
+This replaces `timeBeginPeriod(1)` + `Sleep(1)` polling + a 2 ms spin:
+
+- no global timer-resolution change (which affects the whole system, not just this
+  process);
+- the spin window shrinks from 2 ms to 0.5 ms, roughly halving the render thread's CPU;
+- the ≤ 2 ms slices matter: a single long sleep (e.g. 7 ms) lets the CPU enter a deeper
+  idle state, and the observed wake-up latency then occasionally reached 4–7 ms — enough
+  to blow through the lead margin and miss a composition. Slicing removed those tail
+  events (measured; see [diagnostics.md](diagnostics.md) for the log fields).
+
+Other latency-relevant decisions:
+
 - **Live head point, sampled late**: `GetCursorInfo` is called a second time as late as
   possible — after the historical trail has been drawn and `EndDraw`'d, just before the
   `CopyResource` — and the head point is drawn in a second `BeginDraw`/`EndDraw` pass.
   Head latency is therefore ≈ the render budget (copy + present), not the whole draw.
-- **Adaptive budget**: render-time EMA + 1.0 ms margin, clamped to [1, 8] ms and to 60 %
-  of the refresh period, so it tightens automatically when rendering is fast.
+- **`Present(0)`, never `Present(1,0)`**: blocking present would hand the timing back to
+  DWM and add about a frame.
 - **High-priority render thread**: the main thread is raised to `THREAD_PRIORITY_HIGHEST`
-  (deliberately not `TIME_CRITICAL`, which would preempt DWM/game threads) so the
-  busy-wait and the render are less likely to be preempted into a miss.
-- **Periodic re-measurement**: every 1500 frames the refresh period is re-measured
-  (`DwmFlush`, slow EMA) and the phase re-anchored, to follow VRR / display-mode /
-  refresh-rate changes. A failed re-measure keeps the previous period and phase.
-- **Fallback**: if calibration fails (no DWM composition, or `DwmFlush` not throttling)
-  the loop uses blocking `Present(1,0)` with vsync as the throttle — correctness and
-  trail semantics are unaffected, only the head latency grows by roughly one frame. The
-  fallback path logs a `[frame] … frames rendered` heartbeat every 3000 frames.
+  (deliberately not `TIME_CRITICAL`, which would preempt DWM/game threads) so the render
+  is less likely to be preempted past its deadline.
+- **One render per composition slot**: the deadline must be strictly in the future
+  (`next − lead > now`). Requiring only `next > now` makes the target fall into the past
+  when `now` lands inside the last `lead` of a slot, and the loop then renders several
+  times per displayed frame — which, given that each render consumes one mouse-history
+  watermark, silently shortens the visible trail to a fraction of a frame's movement.
 
 ## Performance characteristics
 
 - Zero-allocation render hot path: samples go into a fixed stack array
   (`GetMouseMovePointsEx` writes into a stack `MOUSEMOVEPOINT[64]`), and the cursor
   texture is captured only when its shape changes.
-- One `GetCursorInfo` + one `GetMouseMovePointsEx` per frame; no background thread, no
-  locks, no dynamic allocation in the frame loop.
+- One `GetCursorInfo` + one `GetMouseMovePointsEx` + one `DwmGetCompositionTimingInfo`
+  per frame; no background thread, no locks, no dynamic allocation in the frame loop.
+  The clock query is cheap: measured 2–6 µs typical, ≤ ~70 µs worst case.
 - The system mouse-move history is a single fixed 64-point buffer shared across all
   threads and processes; movement between two frames is bounded by the mouse report rate
   (typically ≤ 1000 Hz), well below 64 points per frame at normal refresh rates.
 - Health checks (topmost style, virtual-screen geometry, DirectComposition device
   validity) run every 240 frames — a handful of `Get*` calls, no measurable cost.
+- Measured on the reference system at 120 Hz: 119.9 fps, 0.0–0.1 % of frames finishing
+  after their target composition, ~8 % of one core (versus ~15 % for the
+  `DwmFlush` + `timeBeginPeriod` scheme it replaced, at the same frame rate and the same
+  rendering time).

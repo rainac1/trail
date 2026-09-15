@@ -75,8 +75,8 @@ cmake --build build --config Release
   (or VS Developer Command Prompt) environment; `build.bat` does this automatically.
 - **`The build directory is incompatible with the generator`**: `build/` was
   configured with a different generator before — delete `build/` and rebuild.
-- Build with **MSVC**: a MinGW build resolves the DWM entry points to stubs and always
-  ends up in the high-latency fallback path — see
+- Build with **MSVC**: a MinGW build compiles and runs, but MinGW's `libdwmapi.a` stubs
+  some of the DWM entry points, so use the MSVC build when diagnosing — see
   [`diagnostics.md`](diagnostics.md#toolchain-pitfalls).
 - Build/runtime issues are logged to `trail.log` next to the exe; the log can be read
   while the program is running ([`diagnostics.md`](diagnostics.md)).
@@ -104,10 +104,14 @@ trail is exactly the cursor's movement over one frame.
 
 Two behaviours are worth knowing about up front:
 
-- **It runs continuously at the composition refresh rate**, and each frame is submitted
-  just before a vsync so the trail head stays within a few milliseconds of the system
-  cursor. If that alignment cannot be established, it falls back to vsync-throttled
-  presentation (about one frame more head latency).
+- **It runs at the composition refresh rate and submits each frame just before the DWM
+  composition that will display it**: the refresh period and the composition timestamp
+  are read straight from the DWM composition clock (`DwmGetCompositionTimingInfo`, once
+  per frame, a few µs), and a high-resolution waitable timer plus a 0.5 ms spin waits out
+  the deadline, keeping the trail head within a few milliseconds of the system cursor.
+  **There is no fallback**: if the composition clock or the timer is unavailable the
+  program reports the error and exits with code 1 — see [`architecture.md`](architecture.md)
+  and [`limitations.md`](limitations.md).
 - **The overlay's pixels come entirely from DWM** (the window has no GDI content), so a
   lost DXGI/DirectComposition device makes it fully transparent instead of visibly
   broken. That is detected and recovered in-process — see
@@ -115,7 +119,8 @@ Two behaviours are worth knowing about up front:
 
 ## Known limitations
 
-See [`limitations.md`](limitations.md) — device loss costs a few frames before
-the rebuild finishes, the watchdog cannot win against a window stacked above the
-overlay, a blocking `DwmFlush` blocks the single-threaded loop, mixed-DPI multi-monitor
-setups can offset trail coordinates, and a few more.
+See [`limitations.md`](limitations.md) — there is no fallback path (a missing
+prerequisite is a hard error at startup), device loss costs a few frames before the
+rebuild finishes, the watchdog cannot win against a window stacked above the overlay, a
+blocking `Present` blocks the single-threaded loop, mixed-DPI multi-monitor setups can
+offset trail coordinates, and a few more.

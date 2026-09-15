@@ -22,7 +22,7 @@
 //   2. 每帧通过 GPU CopyResource 把离屏纹理拷贝到 composition swapchain backbuffer
 //      （显存内拷贝，硬件加速）。
 //   3. IDCompositionVisual::SetContent(swapchain) 由 DWM 按 premultiplied alpha 合成；
-//      低延迟路径用 Present(0)（vblank 前对齐），回退路径用 Present(1,0) 节流。
+//      每帧 Present(0) 不等待 vsync，提交时机由调用方按 DWM 合成时钟对齐（无降级路径）。
 //
 // 选择 DirectComposition 而非 flip+Hwnd 的原因：部分显示栈对 CreateSwapChainForHwnd
 // + DXGI_ALPHA_MODE_PREMULTIPLIED 返回 DXGI_ERROR_INVALID_CALL，而
@@ -46,14 +46,14 @@ class OverlayRenderer {
   void Shutdown();
 
   // 绘制一帧：把 cursorBmp 绘制到每个采样点位置（热点对齐），然后离屏 ->
-  // swapchain 拷贝并 Present。samples 为历史尾迹点（按时间升序）。drawLiveHead
-  // 为 true 时，在历史点渲染完成、EndDraw 之后（CopyResource 之前）用 GetCursorInfo
-  // 最后一刻采样当前光标位置并单独绘制头部点 —— 替代 GetCursorPos，且把头部采样
-  // 推迟到提交前最后一刻以压缩头部延迟。waitForVBlank=false 时 Present(0) 不等待
-  // vsync（由调用方做 vblank 前对齐）；true 时 Present(1,0) 阻塞等 vsync。
+  // swapchain 拷贝并 Present(0)（不等待 vsync）。samples 为历史尾迹点（按时间升序）。
+  // drawLiveHead 为 true 时，在历史点渲染完成、EndDraw 之后（CopyResource 之前）用
+  // GetCursorInfo 最后一刻采样当前光标位置并单独绘制头部点 —— 替代 GetCursorPos，且
+  // 把头部采样推迟到提交前最后一刻以压缩头部延迟。
+  // 提交时机由调用方按 DWM 合成时钟对齐（见 main.cpp）；本函数不做任何等待或降级。
   FrameResult RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY,
                           const Sample* samples, uint32_t count, int originX, int originY,
-                          bool waitForVBlank, bool drawLiveHead);
+                          bool drawLiveHead);
 
   // DirectComposition 设备是否仍然有效。DirectComposition 在设备丢失时会向合成
   // 其内容的窗口发送 WM_PAINT，应用应在 WM_PAINT 中调用本函数确认设备状态；

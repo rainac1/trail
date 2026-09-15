@@ -10,11 +10,28 @@
   If another always-on-top window (or a fullscreen-exclusive app) sits above the overlay,
   the trail is drawn but not visible, and no amount of re-asserting `WS_EX_TOPMOST` fixes
   that.
-- **The render loop is single-threaded, so a blocking `DwmFlush` blocks the message
-  loop.** If DWM stops composing (fullscreen-exclusive app, display asleep, secure
-  desktop), `DwmFlush` calls in the low-latency path can stall the loop, and the quit
-  hotkey stops responding until composition resumes. This is a deliberate trade: no
-  second thread, no locks, no cross-thread latency.
+- **There is no fallback path by design.** The composition clock
+  (`DwmGetCompositionTimingInfo`) and the high-resolution waitable timer are the only
+  timing mechanisms: if either is unavailable — DWM composition off, an implausible
+  refresh period, or a Windows build older than 10 1803 for
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` — the program logs the reason and exits with
+  code 1 instead of degrading to a slower (but working) presentation mode. `Present(1,0)`
+  and `Sleep`-based polling are deliberately absent.
+- **One composition clock for the whole desktop.** Timing is derived from the single
+  global DWM composition clock, while the window spans every monitor. With outputs at
+  different refresh rates, or with VRR (where the period is not constant), no single
+  period/phase fits all outputs; the deadline follows the composition cadence the OS
+  reports.
+- **A small fraction of frames still misses its composition** (~0.1 % on the reference
+  system at 120 Hz), each time by a few milliseconds of OS scheduling stall. A missed
+  frame is displayed one refresh later. The `[clock]` log line exposes `wake max` and
+  `slack min` so the `lead` margin can be traded against latency.
+- **A skipped composition lengthens the trail for one frame**: if a slot is missed, the
+  next displayed frame carries the mouse movement of two refresh periods.
+- **The render loop is single-threaded**, so anything that blocks it (a blocking `Present`
+  when DWM stops consuming frames, a display asleep, the secure desktop) also stops the
+  message loop and the quit hotkey until composition resumes. This is a deliberate trade:
+  no second thread, no locks, no cross-thread latency.
 - **Mixed-DPI multi-monitor**: the cross-screen window is scaled by DWM, so trail
   coordinates can be offset; single-DPI is recommended.
 - **`--hide-cursor`** hides the cursor only inside the overlay window — which covers the

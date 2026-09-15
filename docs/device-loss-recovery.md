@@ -80,8 +80,9 @@ one belongs to the destroyed D2D device) and resumes rendering. Logged as `[reco
   retried with an exponential backoff (0.5 s → 1 → 2 → 4 → 8 → 15 s, reset to 0.5 s after
   a success). The loop keeps pumping messages between attempts and sleeps up to 50 ms at a
   time, so the quit hotkey stays responsive.
-- After a successful rebuild the vsync period is re-measured and the phase re-anchored
-  (device loss often accompanies a display-mode or refresh-rate change).
+- Nothing needs re-calibrating after a rebuild: the composition clock is re-read every
+  frame, so a display-mode or refresh-rate change that came with the device loss is
+  picked up automatically.
 
 ## Health watchdog
 

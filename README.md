@@ -69,8 +69,8 @@ cmake --build build --config Release
   命令提示符）环境下构建；`build.bat` 会自动完成这一步。
 - **`The build directory is incompatible with the generator`**：`build/` 之前是用别的
   生成器配置的——删掉 `build/` 重新构建。
-- **请用 MSVC 构建**：MinGW 会把 DWM 相关入口解析成 stub，导致程序永远走
-  `Present(1,0)` 高延迟回退路径——见
+- **请用 MSVC 构建**：MinGW 下可编译运行，但它的 `libdwmapi.a` 把部分 DWM 入口做成
+  stub（新旧方案受影响的程度不同），排错时以 MSVC 构建为准——见
   [`docs/diagnostics.md`](docs/diagnostics.md#toolchain-pitfalls)。
 - 构建/运行问题会记录到 exe 同目录的 `trail.log`，该文件**在程序运行期间也能读取**
   （见 [`docs/diagnostics.md`](docs/diagnostics.md)）。
@@ -95,9 +95,11 @@ build\trail.exe --hide-cursor  # 同时隐藏系统光标（在叠加层范围�
 
 有两点值得先知道：
 
-- **它以合成刷新率持续运行**，每帧都在某个 vsync 之前一点点提交，使尾迹头部与系统
-  光标只差几毫秒。如果这种对齐建立不起来，它会回退到由 vsync 节流的提交方式（头部
-  延迟大约多一帧）。
+- **它以合成刷新率持续运行，并在每次合成之前一点点提交**：刷新周期与合成时刻直接读
+  自 DWM 合成时钟（`DwmGetCompositionTimingInfo`，每帧一次、开销约几微秒），用高分辨率
+  可等待定时器加 0.5 ms 自旋精确等到截止时刻，使尾迹头部与系统光标只差几毫秒。
+  **没有降级回退**：读不到合成时钟或定时器不可用会直接报错并以退出码 1 结束进程——见
+  [`docs/architecture.md`](docs/architecture.md) 与 [`docs/limitations.md`](docs/limitations.md)。
 - **叠加层的像素完全由 DWM 提供**（窗口本身没有任何 GDI 内容），因此一旦
   DXGI/DirectComposition 设备丢失，它会整体变透明，而不是“看起来坏掉”。这种情况会
   被检出并在进程内自动恢复——见
@@ -105,6 +107,6 @@ build\trail.exe --hide-cursor  # 同时隐藏系统光标（在叠加层范围�
 
 ## 已知限制
 
-见 [`docs/limitations.md`](docs/limitations.md)。简要来说：设备丢失后需要几帧才能重建
-完成；看门狗无法对抗排在叠加层之上的窗口；单线程设计下 `DwmFlush` 一旦阻塞会连带卡住
-消息循环；混合 DPI 的多显示器环境下尾迹坐标可能偏移，等等。
+见 [`docs/limitations.md`](docs/limitations.md)。简要来说：没有回退路径（不满足前提即报错
+退出）；设备丢失后需要几帧才能重建完成；看门狗无法对抗排在叠加层之上的窗口；单线程设计下
+`Present` 阻塞会连带卡住消息循环；混合 DPI 的多显示器环境下尾迹坐标可能偏移，等等。

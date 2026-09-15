@@ -237,7 +237,7 @@ bool OverlayRenderer::DeviceValid() {
 
 OverlayRenderer::FrameResult OverlayRenderer::RenderFrame(
     ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY, const Sample* samples,
-    uint32_t count, int originX, int originY, bool waitForVBlank, bool drawLiveHead) {
+    uint32_t count, int originX, int originY, bool drawLiveHead) {
   if (!initialized_ || !ctx_) return FrameResult::RecreateDevice;
 
   const D2D1_RECT_F src{0.0f, 0.0f, static_cast<FLOAT>(texW), static_cast<FLOAT>(texH)};
@@ -340,9 +340,9 @@ OverlayRenderer::FrameResult OverlayRenderer::RenderFrame(
     }
   }
 
-  // Present(0)：不等待 vsync，由调用方在 vblank 前对齐提交，帧赶上当前 vsync
-  // 显示（低延迟）；Present(1,0) 则由 DWM 等待下一 vsync（约多 1 帧延迟）。
-  const HRESULT pr = swapChain_->Present(waitForVBlank ? 1 : 0, 0);
+  // Present(0)：不等待 vsync，提交时机由调用方按 DWM 合成时钟对齐（见 main.cpp），
+  // 使帧赶在当前这次合成之前交上去，而不是由 DWM 等到下一次 vsync。
+  const HRESULT pr = swapChain_->Present(0, 0);
   if (IsDeviceLost(pr)) {
     LogHr(L"Present (device lost)", pr);
     return FrameResult::RecreateDevice;
