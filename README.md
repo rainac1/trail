@@ -98,7 +98,7 @@ build\trail.exe --hide-cursor  # 同时隐藏系统光标（在叠加层范围�
 有两点值得先知道：
 
 - **它以合成刷新率持续运行，并在每次合成之前一点点提交**：刷新周期与合成时刻直接读
-  自 DWM 合成时钟（`DwmGetCompositionTimingInfo`，每帧一次、开销约几微秒），用高分辨率
+  自 DWM 合成时钟（`DwmGetCompositionTimingInfo`，每帧一次、约 10 µs），用高分辨率
   可等待定时器加 0.5 ms 自旋精确等到截止时刻，使尾迹头部与系统光标只差几毫秒。
   **没有降级回退**：读不到合成时钟或定时器不可用会直接报错并以退出码 1 结束进程——见
   [`docs/architecture.md`](docs/architecture.md) 与 [`docs/limitations.md`](docs/limitations.md)。

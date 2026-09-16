@@ -23,9 +23,34 @@
   period/phase fits all outputs; the deadline follows the composition cadence the OS
   reports.
 - **A small fraction of frames still misses its composition** (~0.1 % on the reference
-  system at 120 Hz), each time by a few milliseconds of OS scheduling stall. A missed
-  frame is displayed one refresh later. The `[clock]` log line exposes `wake max` and
-  `slack min` so the `lead` margin can be traded against latency.
+  system at 120 Hz), each time by a few milliseconds of OS scheduling stall — a tail no
+  estimator can predict, because what causes it is the scheduler, not the render cost. A
+  missed frame is displayed one refresh later. Ordinary jitter is absorbed automatically
+  (see [architecture.md](architecture.md)); the `[clock]` log line exposes `need max`,
+  `wake max` and `slack min` to check it.
+- **The baseline follows a real change in render cost slowly (τ ≈ 2000 frames ≈ 17 s).** That
+  is what makes it ignore individual stalls, and the cost is the adaptation time: after a
+  resolution or GPU-load change, `lead` is briefly too low (a few missed frames) or briefly
+  generous. The former is bounded because `lead` never drops below `baseline + margin` and the
+  latter is the safe direction.
+- **One `kLeadMarginMs` sets both the head latency and the miss rate**, and there is no feedback
+  loop that tunes it automatically. `lead = baseline + margin` and the mean head latency equals
+  the margin, so the two move together one-for-one; picking it is a manual trade read off the
+  `margin probe` line (see [architecture.md](architecture.md) for the measured curve). It is
+  deliberately not adaptive: the stalls it covers are a property of the OS scheduler, not of the
+  render cost, so there is nothing for it to adapt to.
+- **The `need` tail is non-stationary, so a miss rate is only an average.** At margin 0.60 one
+  session's five 25 s windows spanned 0.10–1.70 % — a 17× spread driven by whatever else the
+  machine was doing (`wake max` 1083 µs in the bad windows versus ~500 µs in the good ones). A
+  margin tuned on one session's average can therefore be several times worse in a bad window;
+  size it against the worst window you are willing to accept, not the mean.
+- **The startup warm-up spends ~5 s at the 2.0 ms default** before any of the measurements
+  above apply, and the following ~1 s seeds the baseline. A short session therefore never
+  leaves that default; the `baseline=0.00` field in the `[clock]` line tells you the warm-up is
+  still running.
+- **A session's largest stall is a cold-start artifact.** Every session measured so far peaked
+  at 4–6 ms within its first 600 frames, against 1.3–3.1 ms later. Anything that tries to size
+  `lead` from early measurements will over-estimate it, which is why the warm-up exists.
 - **A skipped composition lengthens the trail for one frame**: if a slot is missed, the
   next displayed frame carries the mouse movement of two refresh periods.
 - **The render loop is single-threaded**, so anything that blocks it (a blocking `Present`

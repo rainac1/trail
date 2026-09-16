@@ -52,17 +52,75 @@ bool g_displayChanged = false;  // 收到 WM_DISPLAYCHANGE
 // 由此可以删掉：启动 11 次阻塞采样、每 1500 帧 5 次阻塞重测（会周期性掉帧）、
 // 周期 EMA、相位预测，以及 timeBeginPeriod(1) + Sleep(1) 轮询 + 2ms 忙等。
 // 读不到合成时钟或高分辨率定时器不可用即报错退出：本程序不做降级回退。
+//
+// ---- lead（唤醒提前量）策略：慢速需求基线 + 固定余量 ----
+// lead 必须容纳的是"从唤醒目标到提交完成"的全部工作，即 t1 - target（唤醒抖动 +
+// 渲染耗时），下面记作 needMs。
+//
+// needMs 是**重尾**的：实测均值稳定在 0.51~0.58 ms（跨会话、跨分辨率都如此），但单帧
+// 峰值达 1.4~5.7 ms（OS 调度停顿）。也就是说"渲染成本"很稳，需要用余量兜的是"停顿"。
+// 于是操作点就是两者之和：
+//     lead = needMs 的慢速均值 + kLeadMarginMs
+// 均值自适应机器 / 分辨率 / 驱动；余量留给调度停顿 —— 后者是调度器的属性，与渲染成本
+// 无关，所以它不该"自适应"。
+//
+// 关键是**均值取得足够慢**：基线 τ ≈ 2000 帧（≈17s），单次 4 ms 尖峰只把它抬高
+// 0.0005 × 3.5 ≈ 0.002 ms，而真正持续的变化（换分辨率 / 设备）仍在几秒内跟上。
+//
+// 之所以不做"按瞬时 need 追高"（初版 S3）：那会让下行目标远低于维持低漏帧率所需的
+// 水平，系统变成限环 —— 实测 lead 在 1.16 ↔ 2.15 ms 之间来回锯。目标平滑之后跟随器
+// 就不会振荡，上下行速率也就退化成无关紧要的细节（这里只用来平滑启动台阶）。
+//
+// 启动期单独处理：会话开头几百帧是冷启动瞬态（实测会话最大的停顿总是落在这里，达
+// 4~6 ms），所以前 kNeedWarmupFrames 帧不采样、lead 保持 kLeadStartMs；随后
+// kNeedSeedSamples 个样本用精确 running mean 稀释单个尖峰，再转入慢速 EMA。
+// 早期版本直接用第一个样本初始化基线，结果一个 4.19 ms 的冷启动尖峰把操作点抬高了
+// 0.8 ms 并持续约 5000 帧（实测第 3000 帧时 baseline=1.33 ms）。
+// 实测的"margin（≈ 平均头部延迟）→ 漏帧率"曲线（12849 帧，参考机 120Hz，见
+// docs/architecture.md）：
+//     1.20ms→0.06%   0.90→0.23%   0.75→0.40%   0.60→0.69%   0.45→1.35%   0.30→3.2%
+// 每降 0.15 ms 漏帧率约翻一倍 —— 重尾分布没有平坦区，所以不存在"再压一点也没事"。
+// 而且尾部不平稳：同一 margin 在不同 25 秒窗口里能差一个数量级，选值时看最差窗口
+// 而不是均值。取 0.9 是这里的折中（平均头部延迟 0.9 ms、平均漏帧 0.23%、最差窗口 0.43%）。
+// 调这个值不必逐次试跑：[clock] margin probe 行每次运行都会打出上面这条曲线。
+constexpr double kLeadStartMs = 2.0;       // 预热期使用的 lead（实测该值漏帧率 ~0.05%）
+constexpr double kLeadMarginMs = 0.9;      // 操作点余量：lead = 基线 + 它（唯一旋钮）
+constexpr double kNeedSlowAlpha = 0.0005;  // 基线 EMA 系数（τ ≈ 2000 帧 ≈ 16.7s @120Hz）
+constexpr int kNeedWarmupFrames = 600;     // 预热帧数（≈5s @120Hz）：冷启动瞬态不采样
+constexpr int kNeedSeedSamples = 120;      // 播种样本数（≈1s @120Hz）：精确 running mean
+constexpr double kMaxAttackStepMs = 0.25;  // 上行单帧步长上限
+constexpr double kReleaseAlpha = 0.02;     // 下行释放系数（τ ≈ 50 帧 ≈ 0.4s @120Hz）
+constexpr double kLeadMinMs = 1.0;         // lead 下限
+constexpr double kLeadMaxMs = 8.0;         // lead 上限（另受周期 60% 限制）
+
+// margin 探针：统计 (needMs - 基线) 超过各候选 margin 的帧占比。因为漏帧条件正是
+// needMs > lead = 基线 + margin，所以**每个数字就是"把 kLeadMarginMs 取成该值会得到
+// 多少漏帧率"**。这样一次运行就能读出整条"margin → 漏帧率"曲线，不必逐次改参数试跑。
+constexpr double kMarginProbeMs[] = {0.30, 0.45, 0.60, 0.75, 0.90, 1.20};
+constexpr int kMarginProbeCount = 6;
+
 struct VsyncState {
-  uint64_t period = 0;       // 合成刷新周期（QPC ticks）
-  uint64_t deadline = 0;     // 本帧瞄准的合成时刻（QPC）
-  double emaRenderMs = 3.0;  // 渲染耗时 EMA -> 唤醒提前量
+  uint64_t period = 0;             // 合成刷新周期（QPC ticks）
+  uint64_t deadline = 0;           // 本帧瞄准的合成时刻（QPC）
+  double budgetMs = kLeadStartMs;  // 当前生效的 lead
+  double needSlowMs = 0.0;         // needMs 的慢速基线（操作点的自适应部分）
+  int needWarmupLeft = kNeedWarmupFrames;  // 预热剩余帧数
+  int needSeedCount = 0;                   // 已播种的样本数
   uint64_t frameCount = 0;
-  uint64_t missed = 0;       // 渲染在目标合成时刻之后才完成的次数
-  // 每 3000 帧汇总一次的诊断量（用于调 lead：唤醒是否偏晚、渲染完成后余量是否够）
-  uint64_t wakeSum = 0;      // t0 - target 之和（唤醒落后于 target 的量）
+  uint64_t missed = 0;  // 渲染在目标合成时刻之后才完成的次数
+  // 每 3000 帧汇总一次的诊断量（用于核对 lead：唤醒是否偏晚、完成后余量是否够）
+  // 注意：*Sum 每个汇总块都会被清零，所以均值必须除以 statFrames（本块帧数），不能
+  // 除以累计的 frameCount —— 否则第 2 块之后报出的均值会成倍偏小（老代码的 bug）。
+  uint64_t statFrames = 0;
+  uint64_t wakeSum = 0;  // t0 - target 之和（唤醒落后于 target 的量）
   uint64_t wakeMax = 0;
-  int64_t slackSum = 0;      // deadline - t1 之和（正 = 赶在目标合成之前完成）
+  int64_t slackSum = 0;  // deadline - t1 之和（正 = 赶在目标合成之前完成）
   int64_t slackMin = 0;
+  uint64_t needSum = 0;  // t1 - target 之和（= 唤醒抖动 + 渲染耗时）
+  double needMaxMs = 0.0;
+  // margin 探针（见 kMarginProbeMs）：播种完成后才开始计数
+  uint64_t probeFrames = 0;
+  uint64_t probeOver[kMarginProbeCount] = {};
   uint64_t clockReadSum = 0;  // DwmGetCompositionTimingInfo 调用耗时（每帧一次查询）
   uint64_t clockReadMax = 0;
 };
@@ -164,6 +222,19 @@ static bool InitTiming(wchar_t* message, size_t messageCount) {
   return true;
 }
 
+// lead 的统一限幅：上界 min(kLeadMaxMs, 60% 周期) 随刷新率变化，所以每帧按当前
+// period 现算；原先分散在帧循环里的两次 clamp 合并到这一处。
+static double EffectiveLeadMs() {
+  const double periodMs = g_vsync.period ? TicksToMs(g_vsync.period) : kLeadMaxMs;
+  double hi = periodMs * 0.6;
+  if (hi > kLeadMaxMs) hi = kLeadMaxMs;
+  if (hi < kLeadMinMs) hi = kLeadMinMs;  // 极高刷新率下保证下限不高于上限
+  double lead = g_vsync.budgetMs;
+  if (lead < kLeadMinMs) lead = kLeadMinMs;
+  if (lead > hi) lead = hi;
+  return lead;
+}
+
 // 推出本帧的等待目标：把绝对合成栅格 qpcCompose + k*period 推进到"提前 lead 之后
 // 仍在未来"的最近一格，使渲染恰好在这次合成之前完成提交。
 //
@@ -174,13 +245,16 @@ static bool InitTiming(wchar_t* message, size_t messageCount) {
 // 屏幕上的尾迹只有应有的约 1/4 长，所以必须保证每格恰好渲染一次。
 // 起步已晚（目标在过去）时本函数仍会给出未来目标，不再"立即追赶"：错过一格后立即
 // 渲染并不会让画面提前，只会白丢掉一段采样。
-static bool NextFrameTarget(double leadMs, uint64_t& outTarget) {
+static bool NextFrameTarget(uint64_t& outTarget) {
   DWM_TIMING_INFO ti{};
   if (!ReadCompositionClock(ti)) return false;
+  // period 每帧都重读，不做"是否变化"的判断：qpcRefreshPeriod 由刷新率比例换算而来，
+  // 有 tick 级抖动，精确相等会每帧都判为变化。刷新率/显示模式的变化会自动反映到
+  // 60% 周期的 lead 上限与尾迹语义里。
   g_vsync.period = ti.qpcRefreshPeriod;
   const uint64_t period = ti.qpcRefreshPeriod;
   const uint64_t now = QpcNow();
-  const uint64_t lead = MsToTicks(leadMs);
+  const uint64_t lead = MsToTicks(EffectiveLeadMs());
   uint64_t next = ti.qpcCompose;
   const uint64_t earliest = now + lead;  // 目标(target)必须严格晚于 now
   if (next <= earliest) next += period * ((earliest - next) / period + 1);
@@ -447,7 +521,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     DiagClose();
     return 1;
   }
-  double budgetMs = 2.0;
+  // lead 从 VsyncState::budgetMs 起始，之后按"慢速需求基线 + 固定余量"自适应
+  // （见文件头策略说明）。
+  DiagLog(L"[clock] lead policy: start=%.2f ms, margin=%.2f ms (operating point), "
+          L"baseline tau ~ %.0f frames, warmup %d frames, seed %d samples, "
+          L"follower attack<=%.2f ms/frame, release alpha=%.3f",
+          kLeadStartMs, kLeadMarginMs, 1.0 / kNeedSlowAlpha, kNeedWarmupFrames,
+          kNeedSeedSamples, kMaxAttackStepMs, kReleaseAlpha);
   // 提升渲染线程（主线程）优先级：截止时刻对齐对调度抖动敏感，普通优先级下渲染易被
   // 抢占而错过目标合成。用 HIGHEST 而非 TIME_CRITICAL，避免抢占 DWM / 游戏线程。
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -462,6 +542,54 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   int recreateBackoffMs = 500;
   uint64_t nextRecreateTicks = 0;  // 下次尝试重建的时刻（0 = 立即尝试）
   uint64_t lastStatTicks = QpcNow();  // 上次打统计行的时刻（用于算 fps）
+
+  // 汇总并打印自上次调用以来的统计块。每 3000 帧调用一次；退出时再补一次不完整的
+  // 块 —— 否则试跑不到 3000 帧（25 秒）就一行统计都没有，短测拿不到任何数据。
+  // fps 用本块帧数折算，因此整块与残块都正确。
+  const auto logStats = [&]() {
+    if (g_vsync.statFrames == 0) return;
+    const double n = static_cast<double>(g_vsync.frameCount);  // 累计帧数：missed% 用
+    // 均值必须除以本块帧数，见 VsyncState 里的说明。
+    const double bn = static_cast<double>(g_vsync.statFrames);
+    const uint64_t statNow = QpcNow();
+    const double statMs = TicksToMs(statNow - lastStatTicks);
+    lastStatTicks = statNow;
+    DiagLog(L"[clock] frames=%llu fps=%.1f missed=%llu (%.1f%%), lead=%.2f ms "
+            L"(baseline=%.2f), need mean=%.0f max=%.0f us | wake mean=%.0f max=%.0f us, "
+            L"slack mean=%.0f min=%.0f us, clockRead mean=%.0f max=%.0f us",
+            static_cast<unsigned long long>(g_vsync.frameCount), bn * 1000.0 / statMs,
+            static_cast<unsigned long long>(g_vsync.missed),
+            100.0 * static_cast<double>(g_vsync.missed) / n, EffectiveLeadMs(),
+            g_vsync.needSlowMs,
+            TicksToUs(g_vsync.needSum) / bn, g_vsync.needMaxMs * 1000.0,
+            TicksToUs(g_vsync.wakeSum) / bn, TicksToUs(g_vsync.wakeMax),
+            TicksToUsI(g_vsync.slackSum) / bn, TicksToUsI(g_vsync.slackMin),
+            TicksToUs(g_vsync.clockReadSum) / bn, TicksToUs(g_vsync.clockReadMax));
+    if (g_vsync.probeFrames > 0) {
+      const double pn = static_cast<double>(g_vsync.probeFrames);
+      DiagLog(L"[clock] margin probe over %llu frames (need-baseline > x): "
+              L"0.30=%.2f%% 0.45=%.2f%% 0.60=%.2f%% 0.75=%.2f%% 0.90=%.2f%% 1.20=%.2f%%",
+              static_cast<unsigned long long>(g_vsync.probeFrames),
+              100.0 * static_cast<double>(g_vsync.probeOver[0]) / pn,
+              100.0 * static_cast<double>(g_vsync.probeOver[1]) / pn,
+              100.0 * static_cast<double>(g_vsync.probeOver[2]) / pn,
+              100.0 * static_cast<double>(g_vsync.probeOver[3]) / pn,
+              100.0 * static_cast<double>(g_vsync.probeOver[4]) / pn,
+              100.0 * static_cast<double>(g_vsync.probeOver[5]) / pn);
+    }
+    g_vsync.probeFrames = 0;
+    for (int i = 0; i < kMarginProbeCount; ++i) g_vsync.probeOver[i] = 0;
+    g_vsync.statFrames = 0;
+    g_vsync.wakeSum = 0;
+    g_vsync.wakeMax = 0;
+    g_vsync.needSum = 0;
+    g_vsync.needMaxMs = 0.0;
+    g_vsync.slackSum = 0;
+    g_vsync.slackMin = 0;
+    g_vsync.clockReadSum = 0;
+    g_vsync.clockReadMax = 0;
+  };
+
   while (running) {
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
@@ -522,7 +650,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     // 时钟读不到、或定时器等待失败：不降级、不空转，直接报错结束进程。
     uint64_t target = 0;
     const uint64_t tClock0 = QpcNow();
-    const bool haveTarget = NextFrameTarget(budgetMs, target);
+    const bool haveTarget = NextFrameTarget(target);
     const uint64_t tClock1 = QpcNow();
     g_vsync.clockReadSum += tClock1 - tClock0;
     if (tClock1 - tClock0 > g_vsync.clockReadMax) g_vsync.clockReadMax = tClock1 - tClock0;
@@ -552,16 +680,41 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     const uint64_t t1 = QpcNow();
     if (fr == OverlayRenderer::FrameResult::RecreateDevice) g_deviceLost = true;
 
-    // 渲染耗时 EMA -> 唤醒提前量 lead：EMA + 1.0ms 余量，限幅 [1, 8]ms 且不超过
-    // 周期的 60%。余量吸收的是调度抖动与"合成时刻→vblank"的固定相位偏移
-    // （InitTiming 日志里的 qpcVBlank-qpcCompose），可按实测收紧。
-    const double renderMs = TicksToMs(t1 - t0);
-    g_vsync.emaRenderMs = g_vsync.emaRenderMs * 0.9 + renderMs * 0.1;
-    budgetMs = g_vsync.emaRenderMs + 1.0;
-    if (budgetMs < 1.0) budgetMs = 1.0;
-    if (budgetMs > 8.0) budgetMs = 8.0;
-    const double budgetMax = TicksToMs(g_vsync.period) * 0.6;
-    if (budgetMs > budgetMax) budgetMs = budgetMax;
+    // ---- lead：慢速需求基线 + 固定余量（见文件头策略说明）----
+    // 需求信号 = t1 - target = 唤醒抖动 + 渲染耗时，也就是 lead 必须容纳的全部工作。
+    const double needMs = TicksToMs(t1 - target);
+    g_vsync.needSum += t1 - target;
+    if (needMs > g_vsync.needMaxMs) g_vsync.needMaxMs = needMs;
+    // 只采信真正提交成功的帧：Failed / RecreateDevice 会提前返回，耗时系统性偏低。
+    if (fr == OverlayRenderer::FrameResult::Ok) {
+      if (g_vsync.needWarmupLeft > 0) {
+        --g_vsync.needWarmupLeft;  // 预热期：不采样，lead 保持 kLeadStartMs
+      } else {
+        if (g_vsync.needSeedCount < kNeedSeedSamples) {
+          // 播种期：精确 running mean，单个尖峰被样本数稀释。
+          ++g_vsync.needSeedCount;
+          g_vsync.needSlowMs += (needMs - g_vsync.needSlowMs) / g_vsync.needSeedCount;
+        } else {
+          g_vsync.needSlowMs += kNeedSlowAlpha * (needMs - g_vsync.needSlowMs);
+        }
+        // 操作点 = 基线 + 余量。目标本身平滑，所以上下行速率不再影响稳定性。
+        const double targetMs = g_vsync.needSlowMs + kLeadMarginMs;
+        const double diff = targetMs - g_vsync.budgetMs;
+        if (diff > 0) {
+          g_vsync.budgetMs += (diff > kMaxAttackStepMs) ? kMaxAttackStepMs : diff;
+        } else {
+          g_vsync.budgetMs += kReleaseAlpha * diff;
+        }
+        // margin 探针：播种完成后才有意义（播种期基线尚未收敛）。
+        if (g_vsync.needSeedCount >= kNeedSeedSamples) {
+          const double excess = needMs - g_vsync.needSlowMs;
+          ++g_vsync.probeFrames;
+          for (int i = 0; i < kMarginProbeCount; ++i) {
+            if (excess > kMarginProbeMs[i]) ++g_vsync.probeOver[i];
+          }
+        }
+      }
+    }
     ++g_vsync.frameCount;
 
     // 错过：渲染在目标合成时刻之后才完成（即这次合成没赶上）。唤醒比 target 晚几十
@@ -570,6 +723,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
 
     // 诊断累计：唤醒落后 target 多少、渲染完成后距目标合成时刻还有多少余量。
     {
+      ++g_vsync.statFrames;
       const uint64_t wakeLate = t0 - target;
       g_vsync.wakeSum += wakeLate;
       if (wakeLate > g_vsync.wakeMax) g_vsync.wakeMax = wakeLate;
@@ -578,28 +732,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
       if (slack < g_vsync.slackMin) g_vsync.slackMin = slack;
     }
 
-    if (g_vsync.frameCount % 3000 == 0) {
-      const double n = static_cast<double>(g_vsync.frameCount);
-      const uint64_t statNow = QpcNow();
-      const double statMs = TicksToMs(statNow - lastStatTicks);
-      lastStatTicks = statNow;
-      DiagLog(L"[clock] frames=%llu fps=%.1f missed=%llu (%.1f%%), render EMA=%.2f ms, "
-              L"lead=%.2f ms | wake mean=%.0f us max=%.0f us, slack mean=%.0f us min=%.0f us, "
-              L"clockRead mean=%.0f us max=%.0f us",
-              static_cast<unsigned long long>(g_vsync.frameCount), 3000.0 * 1000.0 / statMs,
-              static_cast<unsigned long long>(g_vsync.missed),
-              100.0 * static_cast<double>(g_vsync.missed) / n, g_vsync.emaRenderMs, budgetMs,
-              TicksToUs(g_vsync.wakeSum) / n, TicksToUs(g_vsync.wakeMax),
-              TicksToUsI(g_vsync.slackSum) / n, TicksToUsI(g_vsync.slackMin),
-              TicksToUs(g_vsync.clockReadSum) / n, TicksToUs(g_vsync.clockReadMax));
-      g_vsync.wakeSum = 0;
-      g_vsync.wakeMax = 0;
-      g_vsync.slackSum = 0;
-      g_vsync.slackMin = 0;
-      g_vsync.clockReadSum = 0;
-      g_vsync.clockReadMax = 0;
-    }
+    if (g_vsync.frameCount % 3000 == 0) logStats();
   }
+  logStats();  // 收尾：把退出前那个不完整的块也打出来
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
   if (g_timer) {
     CloseHandle(g_timer);

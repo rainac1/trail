@@ -129,9 +129,89 @@ replaces the whole earlier machinery — 11 blocking `DwmFlush` calls at startup
 every 1500 frames (which dropped a handful of frames each time), a period EMA, and a
 free-running phase prediction that could drift for up to 1500 frames between re-anchors.
 
-The `lead` is the adaptive render budget: `render-time EMA + 1.0 ms`, clamped to [1, 8] ms
-and to 60 % of the period. Its margin absorbs scheduling jitter and the (possibly
-non-zero) offset between the composition and vertical-blank timestamps.
+The `lead` is a **slow requirement baseline plus a fixed margin**. What has to fit inside
+`lead` is `needMs = t1 − target` — wake-up jitter **plus** render time, not render time alone.
+`needMs` is heavy-tailed, but its two halves behave very differently: measured across five
+sessions the **mean is stable at 0.51–0.58 ms**, while single-frame peaks reach 1.4–5.7 ms (OS
+scheduling stalls). The render cost is therefore the part that needs adapting, and the stalls
+are the part that needs a fixed allowance:
+
+    lead = slow baseline (τ ≈ 2000 frames) + kLeadMarginMs (0.6 ms)
+
+The margin is not a fudge factor but a property of the scheduler, which does not change with
+the resolution — so it is fixed and is the one knob traded against the miss rate. The baseline
+is deliberately slow: a single 4 ms stall moves it by only `0.0005 × 3.5 ≈ 0.002 ms`, while a
+genuinely sustained change (a resolution or device change) is still followed within seconds.
+
+Choosing the margin does not have to be iterative. Since a miss is exactly the event
+`needMs > baseline + margin`, the `[clock] margin probe` line counts how often
+`needMs − baseline` exceeds a set of candidate margins, so **each number on that line is the
+miss rate that margin would produce**. One run yields the whole curve.
+
+The earlier version chased the *instantaneous* `needMs` instead. That put the downward target
+around 0.7 ms — far below the ~1.5 ms needed to keep the miss rate low — and turned the scheme
+into a relaxation oscillator: `lead` sawed between 1.16 ms and 2.15 ms, gliding slowly down and
+then being knocked back up by two spikes. A deadband stopped the sawing but the operating point
+drifted up to ~2.1 ms, because the margin was doing double duty as the attack threshold. With a
+smooth target both problems go away, and the up/down rates stop mattering for stability.
+
+Startup is handled separately. The first few hundred frames of a session are a cold-start
+transient — the largest stall of a session consistently lands there, at 4–6 ms, versus
+1.3–3.1 ms later — so the first `600` frames are not sampled at all (`lead` stays at the
+measured-good 2.0 ms default), the next `120` samples seed the baseline with an exact running
+mean so that one spike is diluted, and only then does the slow EMA take over. An earlier version
+seeded the baseline from its very first sample, and a single 4.19 ms cold-start spike then held
+the operating point 0.8 ms too high for about 5000 frames (measured `baseline` = 1.33 ms at
+frame 3000, decaying exactly as `0.53 + 3.66·e^(−3000/2000)` predicts).
+
+Measured on the reference system (120 Hz, 2560×1600, AMD Radeon 780M), against the policies it
+replaced:
+
+| `lead` policy | head latency (`slack` mean) | miss rate |
+|---|---|---|
+| fixed 2.0 ms | 1.47 ms | 0.050 % (9/18 000) |
+| instant-`need` envelope | 0.87 ms | 0.125 % (15/12 000) |
+| the same envelope plus a deadband | 1.41 ms | 0.010 % (1/9940) † |
+| one-shot 5 s calibration | 1.0–4.1 ms across runs | 0.035–0.05 % |
+
+† Not statistically distinguishable from the 0.050 % row — the 95 % CI of 1/9940 is
+0.0003–0.056 %. That, plus the deadband failing to actually bind, is why the scheme was
+simplified to "baseline + margin" instead of being tuned further.
+
+A one-shot calibration is not used because its window sits on the cold-start transient: three
+runs of the same 5 s window produced `lead` = 1.43 / 1.72 / 4.90 ms on unchanged hardware, and a
+"second largest" trim survives only one such sample.
+
+### Choosing the margin
+
+Because the miss condition is exactly `needMs > baseline + margin`, the margin can be chosen from
+measurement instead of by trial. The `[clock] margin probe` line counts how often
+`needMs − baseline` exceeds each candidate margin, so **every number on that line is the miss
+rate that margin would produce**. Across 12 849 measured frames:
+
+| margin (= mean head latency) | miss rate | worst 25 s window |
+|---|---|---|
+| 1.20 ms | 0.062 % | — |
+| **0.90 ms** (shipped) | **0.23 %** | 0.43 % |
+| 0.75 ms | 0.40 % | ~0.9 % |
+| 0.60 ms | 0.69 % | 1.70 % |
+| 0.45 ms | 1.35 % | ~3 % |
+| 0.30 ms | 3.23 % | — |
+
+Note the identity **mean head latency ≈ margin**: `slack = lead − need`, and the baseline is the
+mean of `need`, so the two cancel. The left column is therefore directly readable as the average
+latency the trail head carries.
+
+Two properties of this curve matter when picking a value. It is **steep** — every 0.15 ms costs
+roughly a doubling of the miss rate, so there is no flat region in which "a little less" is free.
+And the tail is **non-stationary**: at margin 0.60 one session's five 25 s windows measured
+0.83 / 1.70 / 0.37 / 0.10 / 0.32 % — a 17× spread, with the bad windows correlating with machine
+activity (`wake max` 1083 µs versus ~500 µs in the good ones). For a metric about visible
+glitches the worst window matters more than the mean, which is why the shipped value sits at
+0.90 ms rather than at the aggressive end of the curve.
+
+`lead` is clamped to [1, 8] ms and to 60 % of the period, computed per frame because the
+period is re-read.
 
 **B. Wait with a high-resolution timer plus a short spin.** The coarse wait is
 `SetWaitableTimerEx` on a timer created with `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`
@@ -170,13 +250,13 @@ Other latency-relevant decisions:
   texture is captured only when its shape changes.
 - One `GetCursorInfo` + one `GetMouseMovePointsEx` + one `DwmGetCompositionTimingInfo`
   per frame; no background thread, no locks, no dynamic allocation in the frame loop.
-  The clock query is cheap: measured 2–6 µs typical, ≤ ~70 µs worst case.
+  The clock query is cheap: measured ≈ 10 µs mean, with worst cases of a few hundred µs.
 - The system mouse-move history is a single fixed 64-point buffer shared across all
   threads and processes; movement between two frames is bounded by the mouse report rate
   (typically ≤ 1000 Hz), well below 64 points per frame at normal refresh rates.
 - Health checks (topmost style, virtual-screen geometry, DirectComposition device
   validity) run every 240 frames — a handful of `Get*` calls, no measurable cost.
-- Measured on the reference system at 120 Hz: 119.9 fps, 0.0–0.1 % of frames finishing
-  after their target composition, ~8 % of one core (versus ~15 % for the
-  `DwmFlush` + `timeBeginPeriod` scheme it replaced, at the same frame rate and the same
-  rendering time).
+- Measured on the reference system at 120 Hz: 119.9 fps, ~8 % of one core (versus ~15 % for
+  the `DwmFlush` + `timeBeginPeriod` scheme it replaced, at the same frame rate and the same
+  rendering time). Frames finishing after their target composition: 0.0–0.1 % (an
+  18 000-frame session at a fixed 2.0 ms lead recorded 9 misses, i.e. 0.05 %).

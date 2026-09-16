@@ -24,7 +24,9 @@ How to find out what the program is doing, especially when "the rendering disapp
 | `[diag] adapter: …` / `[diag] D3D feature level: 0x…` | which GPU/adapter the D3D11 device landed on |
 | `[OverlayRenderer] initialized: W x H, DirectComposition + offscreen blit` | render stack ready |
 | `[clock] DWM composition clock: period=N ms (rateRefresh=a/b), qpcVBlank-qpcCompose=X ms, qpcVBlank-now=Y ms` | the composition clock that everything is timed against; `period` is the refresh period, and the last field says whether the reported timestamp is the upcoming (+) or the last (−) composition |
-| `[clock] frames=N fps=F missed=M (P%), render EMA=X ms, lead=Y ms \| wake mean/max, slack mean/min, clockRead mean/max` | timing health, every 3000 frames. `fps` should equal the refresh rate; `missed` is the share of frames that finished after their target composition; `lead` is the adaptive wake-up margin; `wake` is how late the thread woke relative to its target; `slack` is how much room was left before the target composition when the frame was submitted (negative = missed); `clockRead` is the cost of the `DwmGetCompositionTimingInfo` call |
+| `[clock] lead policy: start=… margin=… baseline tau ~ … warmup … seed … follower …` | the active `lead` policy and its tuning constants, logged once at startup |
+| `[clock] frames=N fps=F missed=M (P%), lead=X ms (baseline=Y), need mean/max, wake mean/max, slack mean/min, clockRead mean/max` | timing health, every 3000 frames. `fps` should equal the refresh rate; `missed` is the share of frames that finished after their target composition (cumulative); `lead` is the wake-up budget currently in force and `baseline` is the slow requirement mean it is built from (`lead = baseline + kLeadMarginMs`, so `baseline` reads 0.00 during the startup warm-up); `need` is `t1 − target`, the work that has to fit inside `lead` (wake-up jitter + render time) — its `max` is what shows how heavy the tail is; `wake` is how late the thread woke relative to its target; `slack` is how much room was left before the target composition when the frame was submitted (negative = missed), so its mean is the average head latency; `clockRead` is the cost of the `DwmGetCompositionTimingInfo` call. The `mean` fields cover one 3000-frame block and reset with each line; the same line is emitted once more at exit to cover the final, incomplete block, so a run shorter than 3000 frames still yields a usable row |
+| `[clock] margin probe over N frames (need-baseline > x): 0.30=…% 0.45=…% …` | the miss rate each candidate `kLeadMarginMs` would produce, measured directly: a miss is exactly `needMs − baseline > margin`. Emitted with each stats block (and at exit); use it to pick the margin instead of re-running with one value at a time |
 | `[recover] …` | device loss detected / rebuilt / rebuild failed (see [device-loss-recovery.md](device-loss-recovery.md)) |
 | `[watch] …` | topmost style re-asserted, or virtual-screen geometry changed |
 | `[OverlayRenderer] <step> failed: 0x…` | D3D/D2D/DComp call failure (device-lost ones are followed by `[recover]`) |
@@ -39,8 +41,17 @@ Reading the timing fields:
   displayed frame carry two slots' worth of trail).
 - `missed` above ~1 % → frames are being submitted after their composition; look at
   `wake max` (a wake-up tail) and `slack min` (how far past the deadline).
-- `clockRead max` in the millisecond range → the DWM query is stalling; today it measures
-  2–6 µs typical, ≤ ~70 µs worst case.
+- `clockRead max` in the millisecond range → the DWM query is stalling; measured ≈ 10 µs
+  mean, with worst cases of a few hundred µs.
+- `lead` well above `need max` → the policy is wasting head latency. `lead` sitting right on
+  `need max` while `missed` climbs → it is too tight. The one knob that trades head latency
+  against `missed` is `kLeadMarginMs` in `src/main.cpp`: the operating point is
+  `baseline + margin`, and `baseline` is measured (≈ 0.55 ms on the reference system), so
+  lowering the margin lowers `lead` one-for-one. Read the `margin probe` line to pick it — it
+  lists the miss rate each candidate margin would produce, from the same run.
+  `kNeedSlowAlpha` sets how fast the baseline follows a real change in render cost; `kNeedWarmupFrames` / `kNeedSeedSamples` keep the
+  cold-start transient out of it; `kMaxAttackStepMs` and `kReleaseAlpha` only shape the
+  follower and no longer affect stability, now that the target is smooth.
 
 ## Triaging "the rendering disappeared"
 
@@ -110,10 +121,9 @@ public class W {
 - **Windows 10 1803+ is required** for `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`. On older
   builds `CreateWaitableTimerExW` fails, and since there is no fallback the program exits
   with the corresponding `FATAL:` message.
-- **Prefer a Release build when comparing latency.** `lead` is derived from the measured
-  render time, so a slower (Debug) build legitimately wakes the render loop earlier and
-  shows a slightly larger head latency. Correctness and log behaviour are the same in
-  both.
+- **Prefer a Release build when comparing latency.** `lead` follows the measured `need`
+  (`t1 − target`), so a slower (Debug) build legitimately raises it and shows a larger head
+  latency. Correctness and log behaviour are the same in both.
 - **`build.bat` reports "Visual Studio C++ toolchain not found"** when `vswhere` cannot
   see an installation. `vswhere` only reports installs registered with the Visual Studio
   Installer — a VS that was copied/moved to another location (or an unregistered/preview

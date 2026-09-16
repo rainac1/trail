@@ -110,7 +110,7 @@ Two behaviours are worth knowing about up front:
 - **It runs at the composition refresh rate and submits each frame just before the DWM
   composition that will display it**: the refresh period and the composition timestamp
   are read straight from the DWM composition clock (`DwmGetCompositionTimingInfo`, once
-  per frame, a few µs), and a high-resolution waitable timer plus a 0.5 ms spin waits out
+  per frame, ≈ 10 µs), and a high-resolution waitable timer plus a 0.5 ms spin waits out
   the deadline, keeping the trail head within a few milliseconds of the system cursor.
   **There is no fallback**: if the composition clock or the timer is unavailable the
   program reports the error and exits with code 1 — see [`architecture.md`](architecture.md)
