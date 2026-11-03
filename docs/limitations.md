@@ -1,81 +1,35 @@
 # Known limitations
 
-- **Device loss is recovered, not prevented.** A lost DXGI/DirectComposition device
-  (driver reset, driver update, display-mode change, monitor hot-plug, sleep/resume,
-  power-management transition) makes the overlay transparent until the render stack is
-  rebuilt. That rebuild is automatic now (a few frames, logged as `[recover]`), but
-  anything drawn in that window is gone — see
-  [device-loss-recovery.md](device-loss-recovery.md).
-- **The watchdog restores the topmost *style*, not z-order against a window above us.**
-  If another always-on-top window (or a fullscreen-exclusive app) sits above the overlay,
-  the trail is drawn but not visible, and no amount of re-asserting `WS_EX_TOPMOST` fixes
-  that.
-- **There is no fallback path by design.** The composition clock
-  (`DwmGetCompositionTimingInfo`) and the high-resolution waitable timer are the only
-  timing mechanisms: if either is unavailable — DWM composition off, an implausible
-  refresh period, or a Windows build older than 10 1803 for
-  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` — the program logs the reason and exits with
-  code 1 instead of degrading to a slower (but working) presentation mode. `Present(1,0)`
-  and `Sleep`-based polling are deliberately absent.
-- **One composition clock for the whole desktop.** Timing is derived from the single
-  global DWM composition clock, while the window spans every monitor. With outputs at
-  different refresh rates, or with VRR (where the period is not constant), no single
-  period/phase fits all outputs; the deadline follows the composition cadence the OS
-  reports.
-- **A small fraction of frames still misses its composition** (~0.1 % on the reference
-  system at 120 Hz), each time by a few milliseconds of OS scheduling stall — a tail no
-  estimator can predict, because what causes it is the scheduler, not the render cost. A
-  missed frame is displayed one refresh later. Ordinary jitter is absorbed automatically
-  (see [architecture.md](architecture.md)); the `[clock]` log line exposes `need max`,
-  `wake max` and `slack min` to check it.
-- **The baseline follows a real change in render cost slowly (τ ≈ 2000 frames ≈ 17 s).** That
-  is what makes it ignore individual stalls, and the cost is the adaptation time: after a
-  resolution or GPU-load change, `lead` is briefly too low (a few missed frames) or briefly
-  generous. The former is bounded because `lead` never drops below `baseline + margin` and the
-  latter is the safe direction.
-- **One `kLeadMarginMs` sets both the head latency and the miss rate**, and there is no feedback
-  loop that tunes it automatically. `lead = baseline + margin` and the mean head latency equals
-  the margin, so the two move together one-for-one; picking it is a manual trade read off the
-  `margin probe` line (see [architecture.md](architecture.md) for the measured curve). It is
-  deliberately not adaptive: the stalls it covers are a property of the OS scheduler, not of the
-  render cost, so there is nothing for it to adapt to.
-- **The `need` tail is non-stationary, so a miss rate is only an average.** At margin 0.60 one
-  session's five 25 s windows spanned 0.10–1.70 % — a 17× spread driven by whatever else the
-  machine was doing (`wake max` 1083 µs in the bad windows versus ~500 µs in the good ones). A
-  margin tuned on one session's average can therefore be several times worse in a bad window;
-  size it against the worst window you are willing to accept, not the mean.
-- **The startup warm-up spends ~5 s at the 2.0 ms default** before any of the measurements
-  above apply, and the following ~1 s seeds the baseline. A short session therefore never
-  leaves that default; the `baseline=0.00` field in the `[clock]` line tells you the warm-up is
-  still running.
-- **A session's largest stall is a cold-start artifact.** Every session measured so far peaked
-  at 4–6 ms within its first 600 frames, against 1.3–3.1 ms later. Anything that tries to size
-  `lead` from early measurements will over-estimate it, which is why the warm-up exists.
-- **A skipped composition lengthens the trail for one frame**: if a slot is missed, the
-  next displayed frame carries the mouse movement of two refresh periods.
-- **The render loop is single-threaded**, so anything that blocks it (a blocking `Present`
-  when DWM stops consuming frames, a display asleep, the secure desktop) also stops the
-  message loop and the quit hotkey until composition resumes. This is a deliberate trade:
-  no second thread, no locks, no cross-thread latency.
-- **Mixed-DPI multi-monitor**: the cross-screen window is scaled by DWM, so trail
-  coordinates can be offset; single-DPI is recommended.
-- **`--hide-cursor`** hides the cursor only inside the overlay window — which covers the
-  whole desktop, so it is effectively global.
-- **Cursor textures are cached by handle.** When the system reuses a handle with the same
-  shape the cache hits and the texture stays correct; an animated cursor shows whichever
-  frame was current when it was captured.
-- **Hardware only**: requires a D3D11 hardware-accelerated GPU and enabled desktop
-  composition (DWM). The program refuses to start without a hardware device (no WARP
-  downgrade).
-- **Initialization failures** are reported by a message box and `trail.log` next to the
-  exe, with the failing step and HRESULT; set `TRAIL_NO_UI=1` to suppress the dialog (the
-  legacy `SUBFRAME_NO_UI` name is still accepted).
-- **The trail head still lags the system cursor** by roughly one render budget (a few
-  milliseconds in the low-latency path, about one frame in the `Present(1,0)` fallback) —
-  the physical floor of sample → DWM composite.
-- **Trail path resolution is bounded by the system mouse report rate** (typically
-  125–1000 Hz) rather than by an explicit sampling interval; extremely fast flicks can
-  still be under-sampled.
-- **The system mouse history stores coordinates in 16-bit form**, so virtual-desktop
-  coordinates are limited to ±32767; layouts wider/taller than 32768 px can mis-track (a
-  rare, multi-8K-monitor edge case).
+- **只画主显示器。** 窗口只覆盖主显示器，其它显示器上没有尾迹；跨屏移动时尾迹在主屏边界处
+  消失。按显示器拆窗口（每屏一个窗口）的实现做过，但多块全屏 layered 窗口会让 DWM 的合成
+  明显变慢——放视频时整个桌面都受影响，所以删掉了。
+- **显示器拓扑 / DPI 是静态的。** 分辨率、DPI、显示器插拔变化不会被跟随；程序只在日志里
+  提示 `restart trail to adapt`，需要重启才能适应。
+- **主显示器上放全屏视频时**，叠加层窗口会阻止视频走独立翻转/硬件平面（DWM 只能整屏合成），
+  弱 GPU 上可能让视频变慢。这是"屏幕上有一个透明叠加层"的固有权衡。
+- **提交节奏是唯一的新鲜度旋钮。** 头部滞后 ≈ 半个 tick 加上 `Commit` → 合成的延迟；程序
+  不读 DWM 合成时钟、也不做相位对齐，最坏情况是画面旧一个 tick，而不是旧一整个刷新周期。
+- **端到端（采样 → 光子）延迟没有测过。** 文档里的数字是 update 路径本身的开销。
+- **`Commit` 可能被 DWM 节流。** 提交过快时 DWM 会反压，`[update]` 里表现为 `commits` 明显
+  低于 `ticks`、`commit max` 升到毫秒级；此时把 `--commit-hz` 调低。
+- **环形槽位数是并发可见采样点的硬上限。** 超出时最老的采样点被覆盖（尾迹变短）。
+  `--trail-ms × 鼠标报告率` 接近这个数时就要调大 `--sprites`。
+- **尾迹寿命是时间窗，不是“一帧的位移”。** 光标停住后，最后几个采样点会保留到
+  `--trail-ms` 到期才消失。
+- **深度顺序在环回点会短暂反转。** 环形槽位的 z 序固定，活点区间跨过环回点的那一瞬间最新
+  点会落到最下面；正常采样密度（相邻点 1–3 px）下看不出来。
+- **单线程。** 任何阻塞（`Commit` 被 DWM 反压、显示器休眠、安全桌面）都会连带卡住消息循环
+  和退出热键。
+- **设备丢失是“恢复”而不是“预防”。** 丢失后叠加层整体变透明，重建需要几百毫秒（重建失败
+  时按 0.5 s → 15 s 退避重试），这期间画的东西都没有。
+- **看门狗只能恢复 `WS_EX_TOPMOST` 样式，抢不回 z-order。** 另一个置顶窗口（或独占全屏
+  程序）盖在上面时，尾迹在画但看不见。
+- **`--hide-cursor` 只在叠加层窗口内隐藏光标**——窗口覆盖主显示器，其它显示器上的光标不受
+  影响。
+- **光标贴图按句柄缓存**：系统复用同一句柄且形状相同时缓存命中（正确）；动画光标显示的是
+  抓取时的那一帧。
+- **只有硬件设备**：需要硬件加速 D3D11 与开启的桌面合成（DWM），不降级 WARP。
+- **系统鼠标历史用 16 位坐标存储**，虚拟桌面坐标限制在 ±32767；更宽/更高的布局会跟丢。
+- **两帧之间新增超过 64 个原始移动点时中间段会丢**：系统只保留 64 个历史点。
+- **初始化失败**通过消息框与 exe 同目录的 `trail.log` 报告，带失败步骤与 HRESULT；设
+  `TRAIL_NO_UI=1` 可禁用弹窗。
