@@ -2,91 +2,108 @@
 #include <windows.h>
 #include <wrl/client.h>
 
-#include <d2d1_1.h>
 #include <d3d11.h>
 #include <dcomp.h>
 #include <dxgi1_2.h>
-#include <dxgi1_3.h>  // IDXGISwapChain2（SetMaximumFrameLatency）：MSVC 在 dxgi1_2.h 中
-                      // 声明，MinGW 放在 dxgi1_3.h；显式包含以兼容两套工具链。
 
+#include <vector>
+
+#include "cursor_texture.h"
 #include "mouse_history.h"
 
-// Direct2D + DirectComposition 全屏透明叠加渲染器（硬件 GPU，无软件降级）。
+// 一个覆盖整个虚拟桌面的窗口 + 一棵 DirectComposition 视觉树。
 //
-// 呈现路径：
-//   1. D2D 渲染到自建 premultiplied 离屏位图（CreateBitmap + D2D1_BITMAP_OPTIONS_TARGET）。
-//      不能直接绑定 flip-model swapchain backbuffer：部分显示栈上
-//      CreateBitmapFromDxgiSurface + flip backbuffer 会返回 E_INVALIDARG。
-//      离屏位图帧间内容保留，故每帧只清除上一帧绘制内容的 bbox（脏矩形清除），
-//      而非全屏 Clear，以降低高分辨率下的 GPU 开销。
-//   2. 每帧通过 GPU CopyResource 把离屏纹理拷贝到 composition swapchain backbuffer
-//      （显存内拷贝，硬件加速）。
-//   3. IDCompositionVisual::SetContent(swapchain) 由 DWM 按 premultiplied alpha 合成；
-//      每帧 Present(0) 不等待 vsync，提交时机由调用方按 DWM 合成时钟对齐（无降级路径）。
+// 尾迹不在像素里：每个采样点是一个 visual，全部共享同一张光标贴图 surface；运行期只改
+// offset / visible，没有绘制、没有拷贝、没有 Present。一个采样点"显示一帧然后消失"变成
+// "把它设成不可见"，于是擦除这个操作根本不存在。
 //
-// 选择 DirectComposition 而非 flip+Hwnd 的原因：部分显示栈对 CreateSwapChainForHwnd
-// + DXGI_ALPHA_MODE_PREMULTIPLIED 返回 DXGI_ERROR_INVALID_CALL，而
-// CreateSwapChainForComposition + 离屏拷贝在同样条件下可用，是更可靠的硬件透明路径。
+// 多显示器：只有一个窗口，覆盖整个虚拟桌面（虚拟屏幕坐标 = 物理像素）。混合 DPI 时窗口
+// 会被 DWM 按它的 DPI 上下文位图缩放，非该 DPI 的显示器上尾迹可能偏移/发虚 —— 这是刻意
+// 接受的取舍：按显示器拆窗口会让 DWM 的合成路径变复杂，实测会拖慢全桌面。
 //
-// 设备丢失（DXGI_ERROR_DEVICE_REMOVED / D2DERR_RECREATE_TARGET 等）：本窗口没有
-// 任何 GDI 内容，可见像素 100% 来自 DWM 合成的 DComp 视觉树，因此设备一旦丢失，
-// 叠加层会整体变透明（"渲染突然消失"），且不会自愈。RenderFrame/DeviceValid 会把
-// 这种情况报为 FrameResult::RecreateDevice / false，调用方必须重建整套设备与内容
-// （官方 CheckDeviceState 文档要求：新的 DXGI + DirectComposition 设备，内容全部重建）。
+// 光标贴图尺寸：GetCursorInfo/CopyIcon 给的是原生位图，系统按 DPI 缩放绘制，所以这里把
+// 它缩放到窗口 DPI 对应的光标像素尺寸（SM_CXCURSOR 随 DPI 变化），避免高 DPI 下尾迹比
+// 真实光标小一圈。
+//
+// 设备丢失：本窗口没有 GDI 内容，可见像素 100% 来自 DWM 合成的视觉树，设备一旦丢失叠加层
+// 会整体变透明且不会自愈 —— 调用方必须重建整套设备与内容（RecreateDevice / DeviceValid）。
 class OverlayRenderer {
  public:
-  // 单帧结果。
   enum class FrameResult {
-    Ok,              // 正常
-    Failed,          // 普通失败（本帧内容可能不完整，但设备仍可用，可继续渲染）
-    RecreateDevice,  // 设备丢失：必须重建整套设备与内容才能恢复显示
+    Ok,              // 正常（本次调用可能没有任何变化，也就没有 Commit）
+    Failed,          // 普通失败（本次状态没提交完整，设备仍可用）
+    RecreateDevice,  // 设备丢失：调用方必须重建整套设备与内容
   };
 
-  bool Initialize(HWND hwnd, int width, int height);
+  // windowRect：窗口在虚拟屏幕坐标里的矩形（物理像素）；dpi：窗口的 DPI。
+  bool Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, int maxSprites);
   void Shutdown();
 
-  // 绘制一帧：把 cursorBmp 绘制到每个采样点位置（热点对齐），然后离屏 ->
-  // swapchain 拷贝并 Present(0)（不等待 vsync）。samples 为历史尾迹点（按时间升序）。
-  // drawLiveHead 为 true 时，在历史点渲染完成、EndDraw 之后（CopyResource 之前）用
-  // GetCursorInfo 最后一刻采样当前光标位置并单独绘制头部点 —— 替代 GetCursorPos，且
-  // 把头部采样推迟到提交前最后一刻以压缩头部延迟。
-  // 提交时机由调用方按 DWM 合成时钟对齐（见 main.cpp）；本函数不做任何等待或降级。
-  FrameResult RenderFrame(ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY,
-                          const Sample* samples, uint32_t count, int originX, int originY,
-                          bool drawLiveHead);
-
-  // DirectComposition 设备是否仍然有效。DirectComposition 在设备丢失时会向合成
-  // 其内容的窗口发送 WM_PAINT，应用应在 WM_PAINT 中调用本函数确认设备状态；
-  // 返回 false 表示必须重建（见类注释）。
-  bool DeviceValid();
-
-  ID2D1DeviceContext* Context() const { return ctx_.Get(); }
-
-  // 初始化是否全部完成（未初始化或已 Shutdown 时为 false）。设备不可用时调用方
-  // 不得渲染：Context() 为 null，光标纹理抓取会解引用空指针。
   bool ready() const { return initialized_; }
 
+  // 设备是否仍然有效。DirectComposition 在设备丢失时会向合成其内容的窗口发送 WM_PAINT。
+  bool DeviceValid();
+
+  // 尾迹寿命（毫秒）：采样点从可见到隐藏的时间窗。
+  void SetTrailLifetimeMs(double ms);
+
+  // 当前可见的采样点视觉数量（诊断用）。
+  int liveSprites() const { return live_; }
+
+  // 现在有没有任何可见内容（头部可见或尾迹点存活）。调用方用它决定要不要显示窗口：
+  // 没有内容的叠加层窗口会挡住下层全屏视频的独立翻转/硬件平面提升。
+  bool visible() const { return headVisible_ || live_ > 0; }
+
+  // 上一次 Commit 的耗时（QPC ticks；本次没有提交时为 0）。诊断 DWM 是否在反压。
+  uint64_t lastCommitTicks() const { return lastCommitTicks_; }
+
+  // 上传光标贴图（形状变化时调用），并按窗口 DPI 缩放到系统光标的像素尺寸。
+  bool SetCursorBitmap(const CursorBitmap& bmp);
+
+  // 把本 tick 新增的采样点分配到环形槽位、隐藏过期槽位、更新头部位置。
+  // samples 可为空（鼠标没动）。只有确有变化时才 Commit；*committed 返回是否提交。
+  FrameResult Update(const Sample* samples, uint32_t count, int headX, int headY, bool showHead,
+                     bool* committed);
+
+  // 立即隐藏所有视觉并提交（光标不可见 / 设备重建后）。
+  void HideAll();
+
  private:
-  // 非设备丢失类的失败只记一次日志（否则会逐帧刷屏），成功一帧后重新武装。
+  struct Slot {
+    Microsoft::WRL::ComPtr<IDCompositionVisual2> visual;
+    Microsoft::WRL::ComPtr<IDCompositionVisual3> visual3;  // SetVisible（Windows 10+）
+    uint64_t bornQpc = 0;
+    bool visible = false;
+  };
+
   void LogFailureOnce(const wchar_t* step, HRESULT hr);
 
   Microsoft::WRL::ComPtr<ID3D11Device> d3dDevice_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3dCtx_;
-  Microsoft::WRL::ComPtr<IDXGIFactory2> dxgiFactory_;
-  Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain_;
-  Microsoft::WRL::ComPtr<ID2D1Factory1> d2dFactory_;
-  Microsoft::WRL::ComPtr<ID2D1Device> d2dDevice_;
-  Microsoft::WRL::ComPtr<ID2D1DeviceContext> ctx_;
-  Microsoft::WRL::ComPtr<ID2D1Bitmap1> offscreen_;  // D2D 渲染目标（premultiplied）
-  Microsoft::WRL::ComPtr<IDCompositionDevice> dcompDevice_;
-  Microsoft::WRL::ComPtr<IDCompositionTarget> dcompTarget_;
-  Microsoft::WRL::ComPtr<IDCompositionVisual> dcompVisual_;
+  // 用 DCompositionCreateDevice3 创建：只有高版本设备创建出来的 visual 才会暴露
+  // IDCompositionVisual3（基础版 DCompositionCreateDevice 只给得到 Visual 基接口）。
+  Microsoft::WRL::ComPtr<IDCompositionDesktopDevice> dcompDevice_;
+  Microsoft::WRL::ComPtr<IDCompositionTarget> target_;
+  Microsoft::WRL::ComPtr<IDCompositionVisual2> root_;
+  Microsoft::WRL::ComPtr<IDCompositionVisual2> head_;
+  Microsoft::WRL::ComPtr<IDCompositionVisual3> head3_;
+  Microsoft::WRL::ComPtr<IDCompositionSurface> spriteSurface_;
+  std::vector<Slot> slots_;  // 环形槽位：新采样点覆盖最老的槽位
 
+  RECT rect_{};  // 窗口矩形（虚拟屏幕坐标）
+  UINT dpi_ = 96;
+  uint64_t qpcFreq_ = 0;
+  uint64_t trailTicks_ = 0;
+  uint64_t lastCommitTicks_ = 0;
+  int nextSlot_ = 0;
+  int live_ = 0;
+  int spriteW_ = 0;
+  int spriteH_ = 0;
+  int hotX_ = 0;
+  int hotY_ = 0;
+  int lastHeadX_ = 0;
+  int lastHeadY_ = 0;
+  bool headVisible_ = false;
   bool initialized_ = false;
   bool loggedFailure_ = false;
-
-  // 脏矩形清除状态：offscreen_ 为 D2D1_BITMAP_OPTIONS_TARGET，帧间内容保留，
-  // 故每帧只需清除上一帧绘制内容覆盖的区域（bbox），无需全屏 Clear。
-  D2D1_RECT_F lastFrameBox_{};  // 上一帧绘制内容（历史点 + 头部点）的 bbox
-  bool hasLastFrameBox_ = false;
 };

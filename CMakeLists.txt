@@ -10,7 +10,8 @@ add_executable(trail WIN32
 )
 
 target_compile_features(trail PRIVATE cxx_std_17)
-target_compile_definitions(trail PRIVATE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+# NOMINMAX：windows.h 默认把 min/max 定义成宏，会和 <algorithm> 的 std::min/std::max 打架。
+target_compile_definitions(trail PRIVATE WINVER=0x0A00 _WIN32_WINNT=0x0A00 NOMINMAX)
 
 if(MSVC)
   # 注意：不要无条件加 /O2 —— Debug 配置（/Od /RTC1）会与之冲突，
@@ -22,4 +23,7 @@ else()
   target_compile_options(trail PRIVATE $<$<CONFIG:Release>:-O3>)
 endif()
 
-target_link_libraries(trail PRIVATE d2d1 d3d11 dxgi dcomp dwmapi winmm)
+# d2d1 / winmm 已不再需要：尾迹由 DirectComposition 视觉树直接合成，没有 D2D 绘制，
+# 也不再使用 timeBeginPeriod 这类全局定时器分辨率接口。dwmapi 只在运行时用
+# GetProcAddress 查 DwmIsCompositionEnabled，不需要导入库。
+target_link_libraries(trail PRIVATE d3d11 dxgi dcomp)

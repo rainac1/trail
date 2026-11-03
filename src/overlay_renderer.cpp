@@ -1,42 +1,37 @@
 #include "overlay_renderer.h"
 
-#include <cfloat>
-#include <cstdio>
-#include <vector>
-
-#include <d2d1helper.h>
+#include <algorithm>
+#include <cmath>
 
 #include "diag.h"
 
 namespace {
-void LogHr(const wchar_t* step, HRESULT hr) {
-  DiagLog(L"[OverlayRenderer] %ls failed: 0x%08X", step, static_cast<unsigned>(hr));
+
+// 设备丢失类错误：D3D/DComp 设备被移除/复位/挂起。出现这些错误时旧的设备、视觉树
+// 全部失效，只能整栈重建（见头文件说明）。
+bool IsDeviceLost(HRESULT hr) {
+  return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+         hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
 }
 
-// 设备丢失类错误：D3D 设备被移除/复位/挂起、D2D 目标需要重建。这些错误下旧的
-// 设备、swapchain 与 DComp 视觉树全部失效，只能整栈重建（见头文件说明）。
-bool IsDeviceLost(HRESULT hr) {
-  return hr == D2DERR_RECREATE_TARGET || hr == DXGI_ERROR_DEVICE_REMOVED ||
-         hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG ||
-         hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+uint64_t QpcNow() {
+  LARGE_INTEGER t;
+  QueryPerformanceCounter(&t);
+  return static_cast<uint64_t>(t.QuadPart);
+}
+
+void LogHr(const wchar_t* step, HRESULT hr) {
+  DiagLog(L"[OverlayRenderer] %ls failed: 0x%08X", step, static_cast<unsigned>(hr));
 }
 
 // 收集会话/合成器/GPU 诊断信息，帮助远程定位初始化失败原因。
 void LogSystemDiagnostics(ID3D11Device* device) {
   BOOL dwm = FALSE;
-  // 先 GetModuleHandleW（dwmapi 常驻时零开销）；未加载则临时 LoadLibraryW，
-  // 用完 FreeLibrary，避免句柄泄漏。
   HMODULE dwmapi = GetModuleHandleW(L"dwmapi.dll");
-  bool ownDwmapi = false;
-  if (!dwmapi) {
-    dwmapi = LoadLibraryW(L"dwmapi.dll");
-    ownDwmapi = true;
-  }
   if (dwmapi) {
     using DwmIsCompFn = HRESULT(WINAPI*)(BOOL*);
     auto fn = reinterpret_cast<DwmIsCompFn>(GetProcAddress(dwmapi, "DwmIsCompositionEnabled"));
     if (fn) fn(&dwm);
-    if (ownDwmapi) FreeLibrary(dwmapi);
   }
   DiagLog(L"[diag] DWM composition %ls", dwm ? L"enabled" : L"DISABLED");
 
@@ -54,24 +49,104 @@ void LogSystemDiagnostics(ID3D11Device* device) {
     }
   }
 }
-}  // namespace
 
-bool OverlayRenderer::Initialize(HWND hwnd, int width, int height) {
-  Shutdown();  // 可直接用于重建：先释放上一次创建的全部对象
-  LogSystemDiagnostics(nullptr);
+// 系统光标在给定 DPI 下的像素尺寸（物理像素）。系统按 DPI 缩放绘制光标，但
+// GetCursorInfo/CopyIcon 给的是原生位图，所以这就是我们要缩放到的目标尺寸。
+int CursorMetricForDpi(int index, UINT dpi) {
+  using GetSystemMetricsForDpiFn = int(WINAPI*)(int, UINT);
+  static const auto fn = reinterpret_cast<GetSystemMetricsForDpiFn>(
+      GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi"));
+  if (fn) return fn(index, dpi);
+  return MulDiv(GetSystemMetrics(index), static_cast<int>(dpi), 96);
+}
 
-  HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1),
-                                 reinterpret_cast<void**>(d2dFactory_.GetAddressOf()));
-  if (FAILED(hr)) {
-    LogHr(L"D2D1CreateFactory", hr);
-    return false;
+uint8_t ClampByte(double v) {
+  if (v <= 0.0) return 0;
+  if (v >= 255.0) return 255;
+  return static_cast<uint8_t>(v + 0.5);
+}
+
+// 把光标位图缩放到指定像素尺寸。像素是预乘 alpha，所以对四个通道直接做面积平均即可
+// （放大时它退化为双线性插值）。热点按同一比例缩放。
+void ScaleCursor(const CursorBitmap& src, int tw, int th, CursorBitmap& dst) {
+  dst = CursorBitmap{};
+  if (tw <= 0 || th <= 0) return;
+  dst.width = tw;
+  dst.height = th;
+  dst.hotX = (src.width > 0)
+                 ? static_cast<int>(std::lround(static_cast<double>(src.hotX) * tw / src.width))
+                 : 0;
+  dst.hotY = (src.height > 0)
+                 ? static_cast<int>(std::lround(static_cast<double>(src.hotY) * th / src.height))
+                 : 0;
+  dst.pixels.assign(static_cast<size_t>(tw) * th * 4, 0);
+  if (src.width <= 0 || src.height <= 0 ||
+      src.pixels.size() < static_cast<size_t>(src.width) * src.height * 4) {
+    return;
   }
 
-  // 仅使用硬件加速设备（WARP 软件渲染不满足高性能目标）。
+  const double sx = static_cast<double>(src.width) / tw;
+  const double sy = static_cast<double>(src.height) / th;
+  for (int y = 0; y < th; ++y) {
+    const double y0 = y * sy;
+    const double y1 = y0 + sy;
+    const int yyBegin = static_cast<int>(std::floor(y0));
+    const int yyEnd = std::min(src.height, static_cast<int>(std::ceil(y1)));
+    for (int x = 0; x < tw; ++x) {
+      const double x0 = x * sx;
+      const double x1 = x0 + sx;
+      const int xxBegin = static_cast<int>(std::floor(x0));
+      const int xxEnd = std::min(src.width, static_cast<int>(std::ceil(x1)));
+      double b = 0.0, g = 0.0, r = 0.0, a = 0.0, wsum = 0.0;
+      for (int yy = yyBegin; yy < yyEnd; ++yy) {
+        const double wy =
+            std::min(y1, static_cast<double>(yy + 1)) - std::max(y0, static_cast<double>(yy));
+        if (wy <= 0.0) continue;
+        for (int xx = xxBegin; xx < xxEnd; ++xx) {
+          const double wx =
+              std::min(x1, static_cast<double>(xx + 1)) - std::max(x0, static_cast<double>(xx));
+          if (wx <= 0.0) continue;
+          const double w = wx * wy;
+          const uint8_t* p = &src.pixels[(static_cast<size_t>(yy) * src.width + xx) * 4];
+          b += p[0] * w;
+          g += p[1] * w;
+          r += p[2] * w;
+          a += p[3] * w;
+          wsum += w;
+        }
+      }
+      uint8_t* q = &dst.pixels[(static_cast<size_t>(y) * tw + x) * 4];
+      if (wsum > 0.0) {
+        q[0] = ClampByte(b / wsum);
+        q[1] = ClampByte(g / wsum);
+        q[2] = ClampByte(r / wsum);
+        q[3] = ClampByte(a / wsum);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, int maxSprites) {
+  Shutdown();  // 可直接用于重建：先释放上一次创建的全部对象
+
+  if (!hwnd || maxSprites < 1) return false;
+  rect_ = windowRect;
+  dpi_ = dpi ? dpi : 96;
+
+  LARGE_INTEGER freq{};
+  if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0) {
+    DiagLog(L"[OverlayRenderer] QueryPerformanceFrequency failed");
+    return false;
+  }
+  qpcFreq_ = static_cast<uint64_t>(freq.QuadPart);
+
+  // 仅使用硬件加速设备（WARP 软件渲染不满足延迟目标）。
   const UINT deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
-  hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags, nullptr, 0,
-                         D3D11_SDK_VERSION, &d3dDevice_, &featureLevel, nullptr);
+  HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags, nullptr,
+                                 0, D3D11_SDK_VERSION, &d3dDevice_, &featureLevel, nullptr);
   if (FAILED(hr)) {
     LogHr(L"D3D11 hardware device", hr);
     return false;
@@ -86,134 +161,134 @@ bool OverlayRenderer::Initialize(HWND hwnd, int width, int height) {
     LogHr(L"device->IDXGIDevice QI", hr);
     return false;
   }
-  Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
-  hr = dxgiDevice->GetAdapter(&adapter);
-  if (FAILED(hr)) {
-    LogHr(L"GetAdapter", hr);
-    return false;
-  }
-  hr = adapter->GetParent(IID_PPV_ARGS(&dxgiFactory_));
-  if (FAILED(hr)) {
-    LogHr(L"GetParent(IDXGIFactory2)", hr);
-    return false;
-  }
 
-  hr = d2dFactory_->CreateDevice(dxgiDevice.Get(), &d2dDevice_);
+  // 必须用 DCompositionCreateDevice3：基础版 DCompositionCreateDevice 创建出来的
+  // visual 只暴露 Visual 基接口，QI 不到 IDCompositionVisual3（SetVisible）。
+  hr = DCompositionCreateDevice3(dxgiDevice.Get(), IID_PPV_ARGS(&dcompDevice_));
   if (FAILED(hr)) {
-    LogHr(L"CreateDevice", hr);
+    LogHr(L"DCompositionCreateDevice3", hr);
     return false;
   }
-  hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &ctx_);
-  if (FAILED(hr)) {
-    LogHr(L"CreateDeviceContext", hr);
-    return false;
-  }
-
-  // composition swapchain：premultiplied alpha 由 DWM 视觉树合成。
-  // 注意：FLIP_DISCARD 每次 Present 轮换 backbuffer，因此每帧都必须重新
-  // GetBuffer(0) 获取当前后缓冲，不能缓存纹理（见 RenderFrame）。
-  DXGI_SWAP_CHAIN_DESC1 desc{};
-  desc.Width = static_cast<UINT>(width);
-  desc.Height = static_cast<UINT>(height);
-  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-  desc.SampleDesc.Count = 1;
-  desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-  desc.BufferCount = 2;
-  desc.Scaling = DXGI_SCALING_STRETCH;
-  desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-  desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-  hr = dxgiFactory_->CreateSwapChainForComposition(d3dDevice_.Get(), &desc, nullptr, &swapChain_);
-  if (FAILED(hr)) {
-    LogHr(L"CreateSwapChainForComposition", hr);
-    return false;
-  }
-  // 限制 DWM 合成队列深度为 1：避免极端情况下 Present(0) 提交的帧在合成队列中
-  // 堆积，导致 DWM 显示的是较旧的帧。对 composition swapchain 是最低成本的保险
-  // （不支持时静默忽略）。
-  Microsoft::WRL::ComPtr<IDXGISwapChain2> sc2;
-  if (SUCCEEDED(swapChain_.As(&sc2))) sc2->SetMaximumFrameLatency(1);
-
-  // D2D 渲染目标：自建 premultiplied 离屏位图（不直接绑定 swapchain backbuffer，
-  // 部分显示栈上 CreateBitmapFromDxgiSurface + flip backbuffer 会返回 E_INVALIDARG）。
-  std::vector<uint8_t> zeros(static_cast<size_t>(width) * height * 4, 0);
-  D2D1_BITMAP_PROPERTIES1 bp{};
-  bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-  bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-  bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-  hr = ctx_->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(width), static_cast<UINT32>(height)),
-                          zeros.data(), static_cast<UINT32>(width) * 4, bp, &offscreen_);
-  if (FAILED(hr)) {
-    LogHr(L"CreateBitmap (offscreen target)", hr);
-    return false;
-  }
-  ctx_->SetTarget(offscreen_.Get());
-
-  // DirectComposition：把 swapchain 挂到窗口的 DWM 视觉树。
-  hr = DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(&dcompDevice_));
-  if (FAILED(hr)) {
-    LogHr(L"DCompositionCreateDevice", hr);
-    return false;
-  }
-  hr = dcompDevice_->CreateTargetForHwnd(hwnd, TRUE, &dcompTarget_);
+  hr = dcompDevice_->CreateTargetForHwnd(hwnd, TRUE, &target_);
   if (FAILED(hr)) {
     LogHr(L"CreateTargetForHwnd", hr);
     return false;
   }
-  hr = dcompDevice_->CreateVisual(&dcompVisual_);
+  hr = dcompDevice_->CreateVisual(&root_);
   if (FAILED(hr)) {
-    LogHr(L"CreateVisual", hr);
+    LogHr(L"CreateVisual(root)", hr);
     return false;
   }
-  hr = dcompVisual_->SetContent(swapChain_.Get());
-  if (FAILED(hr)) {
-    LogHr(L"SetContent", hr);
-    return false;
-  }
-  hr = dcompTarget_->SetRoot(dcompVisual_.Get());
+  hr = target_->SetRoot(root_.Get());
   if (FAILED(hr)) {
     LogHr(L"SetRoot", hr);
     return false;
   }
-  hr = dcompDevice_->Commit();
+
+  // 环形槽位：每个槽位一个 visual，初始不可见。新采样点覆盖最老的槽位，
+  // 因此槽位数就是"同时可见的采样点上限"。
+  //
+  // 初始树序（零成本，只在初始化时排一次）：AddVisual 在 referenceVisual 为 NULL 时
+  // 语义是反的 —— insertAbove=TRUE 表示"插到最底层"，FALSE 表示"插到最上层"。这里用
+  // FALSE，让后加入的槽位在上层；环形槽位按下标递增分配新点，于是"活着的连续一段槽位"
+  // 里下标越大 = 越新 = 越靠上，深度顺序在绝大多数时刻是对的。
+  slots_.clear();
+  slots_.reserve(static_cast<size_t>(maxSprites));
+  for (int i = 0; i < maxSprites; ++i) {
+    Slot slot;
+    hr = dcompDevice_->CreateVisual(&slot.visual);
+    if (FAILED(hr)) {
+      LogHr(L"CreateVisual(sprite)", hr);
+      return false;
+    }
+    hr = slot.visual.As(&slot.visual3);
+    if (FAILED(hr)) {
+      LogHr(L"visual->IDCompositionVisual3 QI (Windows 10+ required)", hr);
+      return false;
+    }
+    slot.visual3->SetVisible(FALSE);
+    hr = root_->AddVisual(slot.visual.Get(), FALSE, nullptr);
+    if (FAILED(hr)) {
+      LogHr(L"AddVisual(sprite)", hr);
+      return false;
+    }
+    slots_.push_back(std::move(slot));
+  }
+
+  // 头部视觉最后加入 => 位于所有尾迹点之上。
+  hr = dcompDevice_->CreateVisual(&head_);
   if (FAILED(hr)) {
-    LogHr(L"Commit", hr);
+    LogHr(L"CreateVisual(head)", hr);
+    return false;
+  }
+  hr = head_.As(&head3_);
+  if (FAILED(hr)) {
+    LogHr(L"head->IDCompositionVisual3 QI (Windows 10+ required)", hr);
+    return false;
+  }
+  head3_->SetVisible(FALSE);
+  hr = root_->AddVisual(head_.Get(), FALSE, nullptr);
+  if (FAILED(hr)) {
+    LogHr(L"AddVisual(head)", hr);
     return false;
   }
 
-  lastFrameBox_ = D2D1_RECT_F{};
-  hasLastFrameBox_ = false;
+  hr = dcompDevice_->Commit();
+  if (FAILED(hr)) {
+    LogHr(L"Commit (init)", hr);
+    return false;
+  }
+
+  nextSlot_ = 0;
+  live_ = 0;
+  headVisible_ = false;
   loggedFailure_ = false;
   initialized_ = true;
-
-  DiagLog(L"[OverlayRenderer] initialized: %d x %d, DirectComposition + offscreen blit", width,
-          height);
+  DiagLog(L"[OverlayRenderer] initialized: %d sprite visuals + head, DirectComposition visual tree",
+          maxSprites);
   return true;
 }
 
 void OverlayRenderer::Shutdown() {
-  // 释放顺序：先解绑渲染目标与视觉树内容，再自内向外销毁（内容 -> 目标 ->
-  // DComp 设备 -> swapchain -> D2D -> DXGI/D3D），避免 DWM 仍引用已释放的交换链。
-  if (ctx_) {
-    ctx_->SetTarget(nullptr);
-    ctx_->Flush();
-  }
-  offscreen_.Reset();
-  if (dcompVisual_) dcompVisual_->SetContent(nullptr);
-  if (dcompTarget_) dcompTarget_->SetRoot(nullptr);
-  if (dcompDevice_) dcompDevice_->Commit();  // 尽力而为：失败无需处理
-  dcompVisual_.Reset();
-  dcompTarget_.Reset();
+  // 先解绑视觉树与根，再释放（视觉 -> 根 -> 目标 -> surface -> DComp 设备 -> D3D），
+  // 避免 DWM 仍引用已释放的内容。
+  if (target_) target_->SetRoot(nullptr);
+  slots_.clear();
+  head3_.Reset();
+  head_.Reset();
+  root_.Reset();
+  target_.Reset();
+  spriteSurface_.Reset();
   dcompDevice_.Reset();
-  swapChain_.Reset();
-  d2dDevice_.Reset();
-  ctx_.Reset();
-  d2dFactory_.Reset();
-  dxgiFactory_.Reset();
   d3dCtx_.Reset();
   d3dDevice_.Reset();
 
-  hasLastFrameBox_ = false;
+  live_ = 0;
+  nextSlot_ = 0;
+  headVisible_ = false;
+  spriteW_ = 0;
+  spriteH_ = 0;
+  hotX_ = 0;
+  hotY_ = 0;
   initialized_ = false;
+}
+
+bool OverlayRenderer::DeviceValid() {
+  // 用 D3D 设备的移除原因判断：DCompositionCreateDevice3 返回的
+  // IDCompositionDesktopDevice 没有 CheckDeviceState（那在基础版 IDCompositionDevice 上），
+  // 而 DComp 设备本身由这个 D3D 设备支撑，D3D 被移除/复位时 DComp 内容也一并失效。
+  if (!initialized_ || !d3dDevice_) return false;
+  const HRESULT reason = d3dDevice_->GetDeviceRemovedReason();
+  if (FAILED(reason)) {
+    DiagLog(L"[OverlayRenderer] device removed: 0x%08X", static_cast<unsigned>(reason));
+    return false;
+  }
+  return true;
+}
+
+void OverlayRenderer::SetTrailLifetimeMs(double ms) {
+  if (ms < 0.0) ms = 0.0;
+  trailTicks_ = static_cast<uint64_t>(ms * static_cast<double>(qpcFreq_) / 1000.0);
 }
 
 void OverlayRenderer::LogFailureOnce(const wchar_t* step, HRESULT hr) {
@@ -223,135 +298,203 @@ void OverlayRenderer::LogFailureOnce(const wchar_t* step, HRESULT hr) {
           static_cast<unsigned>(hr));
 }
 
-bool OverlayRenderer::DeviceValid() {
+bool OverlayRenderer::SetCursorBitmap(const CursorBitmap& bmp) {
   if (!initialized_ || !dcompDevice_) return false;
-  BOOL valid = FALSE;
-  const HRESULT hr = dcompDevice_->CheckDeviceState(&valid);
-  if (FAILED(hr) || !valid) {
-    DiagLog(L"[OverlayRenderer] CheckDeviceState: invalid (hr=0x%08X, valid=%d)",
-            static_cast<unsigned>(hr), static_cast<int>(valid));
+  if (bmp.width <= 0 || bmp.height <= 0) return false;
+
+  // 缩放到窗口 DPI 对应的系统光标像素尺寸（系统按 DPI 缩放绘制光标，原生位图偏小）。
+  const int targetW = CursorMetricForDpi(SM_CXCURSOR, dpi_);
+  const int targetH = CursorMetricForDpi(SM_CYCURSOR, dpi_);
+  if (targetW <= 0 || targetH <= 0) return false;
+  CursorBitmap scaled;
+  ScaleCursor(bmp, targetW, targetH, scaled);
+
+  Microsoft::WRL::ComPtr<IDCompositionSurface> surface;
+  HRESULT hr = dcompDevice_->CreateSurface(static_cast<UINT>(scaled.width),
+                                           static_cast<UINT>(scaled.height),
+                                           DXGI_FORMAT_B8G8R8A8_UNORM,
+                                           DXGI_ALPHA_MODE_PREMULTIPLIED, &surface);
+  if (FAILED(hr)) {
+    LogHr(L"CreateSurface", hr);
+    return false;
+  }
+
+  POINT offset{0, 0};
+  Microsoft::WRL::ComPtr<IDXGISurface> dxgiSurface;
+  hr = surface->BeginDraw(nullptr, IID_PPV_ARGS(&dxgiSurface), &offset);
+  if (FAILED(hr)) {
+    LogHr(L"surface BeginDraw", hr);
+    return false;
+  }
+
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> dst;
+  hr = dxgiSurface.As(&dst);
+  if (SUCCEEDED(hr)) {
+    // 先把像素上传到一张普通纹理，再用 CopySubresourceRegion 写进 surface
+    // （surface 的更新区可能带 offset，UpdateSubresource 无法写子矩形）。
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = static_cast<UINT>(scaled.width);
+    td.Height = static_cast<UINT>(scaled.height);
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> src;
+    hr = d3dDevice_->CreateTexture2D(&td, nullptr, &src);
+    if (SUCCEEDED(hr)) {
+      d3dCtx_->UpdateSubresource(src.Get(), 0, nullptr, scaled.pixels.data(),
+                                 static_cast<UINT>(scaled.width) * 4, 0);
+      const D3D11_BOX box{0, 0, 0, static_cast<UINT>(scaled.width),
+                          static_cast<UINT>(scaled.height), 1};
+      d3dCtx_->CopySubresourceRegion(dst.Get(), 0, static_cast<UINT>(offset.x),
+                                     static_cast<UINT>(offset.y), 0, src.Get(), 0, &box);
+    }
+  }
+  const HRESULT endHr = surface->EndDraw();
+  if (FAILED(hr)) {
+    LogHr(L"upload sprite pixels", hr);
+    return false;
+  }
+  if (FAILED(endHr)) {
+    LogHr(L"surface EndDraw", endHr);
+    return false;
+  }
+
+  spriteSurface_ = surface;
+  spriteW_ = scaled.width;
+  spriteH_ = scaled.height;
+  hotX_ = scaled.hotX;
+  hotY_ = scaled.hotY;
+
+  // 把新内容挂到所有视觉上，并让他们不可见（位置在下次 Update 时才确定）。
+  for (auto& slot : slots_) {
+    slot.visual->SetContent(spriteSurface_.Get());
+    slot.visual3->SetVisible(FALSE);
+    slot.visible = false;
+    slot.bornQpc = 0;
+  }
+  head_->SetContent(spriteSurface_.Get());
+  head3_->SetVisible(FALSE);
+  headVisible_ = false;
+  live_ = 0;
+  nextSlot_ = 0;
+  lastHeadX_ = 0;
+  lastHeadY_ = 0;
+
+  hr = dcompDevice_->Commit();
+  if (FAILED(hr)) {
+    LogHr(L"Commit (sprite)", hr);
     return false;
   }
   return true;
 }
 
-OverlayRenderer::FrameResult OverlayRenderer::RenderFrame(
-    ID2D1Bitmap* cursorBmp, int texW, int texH, int hotX, int hotY, const Sample* samples,
-    uint32_t count, int originX, int originY, bool drawLiveHead) {
-  if (!initialized_ || !ctx_) return FrameResult::RecreateDevice;
+OverlayRenderer::FrameResult OverlayRenderer::Update(const Sample* samples, uint32_t count,
+                                                     int headX, int headY, bool showHead,
+                                                     bool* committed) {
+  if (committed) *committed = false;
+  if (!initialized_) return FrameResult::RecreateDevice;
 
-  const D2D1_RECT_F src{0.0f, 0.0f, static_cast<FLOAT>(texW), static_cast<FLOAT>(texH)};
-  // 屏幕坐标 -> 窗口客户区坐标（窗口左上角 = 虚拟屏幕原点）。
-  const auto dstFor = [&](int x, int y) {
-    const FLOAT left = static_cast<FLOAT>(x - hotX - originX);
-    const FLOAT top = static_cast<FLOAT>(y - hotY - originY);
-    return D2D1_RECT_F{left, top, left + static_cast<FLOAT>(texW), top + static_cast<FLOAT>(texH)};
-  };
-
-  // 本帧绘制内容 bbox（用于下一帧脏矩形清除）。
-  D2D1_RECT_F curBox{FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
-  const auto extend = [&](const D2D1_RECT_F& r) {
-    if (r.left < curBox.left) curBox.left = r.left;
-    if (r.top < curBox.top) curBox.top = r.top;
-    if (r.right > curBox.right) curBox.right = r.right;
-    if (r.bottom > curBox.bottom) curBox.bottom = r.bottom;
-  };
-
-  // ---- pass 1：清除上一帧残留 + 绘制历史尾迹 ----
-  ctx_->BeginDraw();
-  if (hasLastFrameBox_) {
-    // 只清除上一帧绘制内容覆盖的区域，替代全屏 Clear（高分辨率下大幅降低开销）。
-    ctx_->PushAxisAlignedClip(lastFrameBox_, D2D1_ANTIALIAS_MODE_ALIASED);
-    ctx_->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
-    ctx_->PopAxisAlignedClip();
+  // 还没有可用的光标贴图：保证不残留任何可见内容。
+  if (!spriteSurface_ || slots_.empty()) {
+    HideAll();
+    return FrameResult::Ok;
   }
-  if (cursorBmp) {
-    for (uint32_t i = 0; i < count; ++i) {
-      const D2D1_RECT_F dst = dstFor(samples[i].x, samples[i].y);
-      // NEAREST_NEIGHBOR：光标像素 1:1 锐利，且是开销最低的插值模式。
-      ctx_->DrawBitmap(cursorBmp, dst, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
-      extend(dst);
+
+  const uint64_t now = QpcNow();
+  bool dirty = false;
+  lastCommitTicks_ = 0;
+
+  // ---- 新采样点：占用环形槽位。新点覆盖最老的槽位，所以槽位数就是可见点上限。----
+  for (uint32_t i = 0; i < count; ++i) {
+    // 只服务窗口覆盖的那块显示器：别的显示器上的采样点直接丢弃（否则它们会占着槽位，
+    // 让主屏上能看见的点变少）。
+    if (samples[i].x < rect_.left || samples[i].x >= rect_.right || samples[i].y < rect_.top ||
+        samples[i].y >= rect_.bottom) {
+      continue;
+    }
+    Slot& slot = slots_[static_cast<size_t>(nextSlot_)];
+    nextSlot_ = (nextSlot_ + 1) % static_cast<int>(slots_.size());
+    // offset 用窗口客户区坐标（窗口左上角 = 虚拟屏幕原点）。
+    slot.visual->SetOffsetX(static_cast<float>(samples[i].x - rect_.left - hotX_));
+    slot.visual->SetOffsetY(static_cast<float>(samples[i].y - rect_.top - hotY_));
+    if (!slot.visible) {
+      slot.visible = true;
+      slot.visual3->SetVisible(TRUE);
+      ++live_;
+    }
+    slot.bornQpc = now;
+    dirty = true;
+  }
+
+  // ---- 过期：时间窗之外的采样点隐藏。这就是"擦除"，它只是一次 SetVisible(FALSE)。----
+  if (trailTicks_ > 0 && live_ > 0) {
+    for (auto& slot : slots_) {
+      if (slot.visible && (now - slot.bornQpc) > trailTicks_) {
+        slot.visible = false;
+        --live_;
+        slot.visual3->SetVisible(FALSE);
+        dirty = true;
+      }
     }
   }
-  HRESULT hr = ctx_->EndDraw();
+
+  // ---- 头部：只在 --hide-cursor 模式下显示（系统光标可见时它被硬件光标完全遮住）。----
+  const bool headInside = showHead && headX >= rect_.left && headX < rect_.right &&
+                          headY >= rect_.top && headY < rect_.bottom;
+  if (headInside) {
+    if (!headVisible_ || headX != lastHeadX_ || headY != lastHeadY_) {
+      head_->SetOffsetX(static_cast<float>(headX - rect_.left - hotX_));
+      head_->SetOffsetY(static_cast<float>(headY - rect_.top - hotY_));
+      lastHeadX_ = headX;
+      lastHeadY_ = headY;
+      if (!headVisible_) {
+        headVisible_ = true;
+        head3_->SetVisible(TRUE);
+      }
+      dirty = true;
+    }
+  } else if (headVisible_) {
+    headVisible_ = false;
+    head3_->SetVisible(FALSE);
+    dirty = true;
+  }
+
+  if (!dirty) return FrameResult::Ok;  // 静止且无过期：一个 COM 调用都不做
+
+  const uint64_t commitStart = QpcNow();
+  const HRESULT hr = dcompDevice_->Commit();
+  lastCommitTicks_ = QpcNow() - commitStart;
   if (IsDeviceLost(hr)) {
-    LogHr(L"EndDraw (device lost)", hr);
+    LogHr(L"Commit (device lost)", hr);
     return FrameResult::RecreateDevice;
   }
   if (FAILED(hr)) {
-    LogFailureOnce(L"EndDraw", hr);
+    LogFailureOnce(L"Commit", hr);
     return FrameResult::Failed;
   }
-
-  // ---- pass 2：实时头部点（提交前最后一刻采样，最小化头部延迟）----
-  // 用 GetCursorInfo（替代 GetCursorPos）在历史点 EndDraw 之后、CopyResource 之前
-  // 采样当前光标位置并绘制，把头部采样推迟到提交前最后一刻。
-  if (drawLiveHead && cursorBmp) {
-    CURSORINFO ci{sizeof(ci)};
-    if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING)) {
-      const D2D1_RECT_F dst = dstFor(ci.ptScreenPos.x, ci.ptScreenPos.y);
-      ctx_->BeginDraw();
-      ctx_->DrawBitmap(cursorBmp, dst, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
-      hr = ctx_->EndDraw();
-      if (IsDeviceLost(hr)) {
-        LogHr(L"EndDraw (live head, device lost)", hr);
-        return FrameResult::RecreateDevice;
-      }
-      if (FAILED(hr)) {
-        LogFailureOnce(L"EndDraw (live head)", hr);
-        return FrameResult::Failed;
-      }
-      extend(dst);
-    }
-  }
-
-  // 记录本帧 bbox 供下一帧清除（本帧无内容则下一帧无需清除）。
-  if (curBox.left <= curBox.right && curBox.top <= curBox.bottom) {
-    lastFrameBox_ = curBox;
-    hasLastFrameBox_ = true;
-  } else {
-    hasLastFrameBox_ = false;
-  }
-
-  // 离屏渲染结果 -> 当前 swapchain backbuffer（GPU 显存拷贝），再 Present。
-  // FLIP_DISCARD 每帧轮换 buffer，故必须每帧重新 GetBuffer(0)。
-  if (d3dCtx_ && offscreen_) {
-    Microsoft::WRL::ComPtr<IDXGISurface> backSurface;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> backTex;
-    Microsoft::WRL::ComPtr<IDXGISurface> offSurface;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> offTex;
-    HRESULT cr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backSurface));
-    if (SUCCEEDED(cr)) cr = backSurface.As(&backTex);
-    if (SUCCEEDED(cr)) cr = offscreen_->GetSurface(&offSurface);
-    if (SUCCEEDED(cr)) cr = offSurface.As(&offTex);
-    if (SUCCEEDED(cr)) {
-      d3dCtx_->CopyResource(backTex.Get(), offTex.Get());
-    } else {
-      // 拷贝路径失败时才向驱动查询设备移除原因（成功路径不做任何额外调用，热路径
-      // 每帧开销保持不变）；设备确实被移除则升级为整栈重建。
-      if (IsDeviceLost(cr) || IsDeviceLost(d3dDevice_->GetDeviceRemovedReason())) {
-        LogHr(L"copy offscreen -> backbuffer (device lost)", cr);
-        return FrameResult::RecreateDevice;
-      }
-      // 拷贝失败：本帧 backbuffer 内容是旧的（画面可能短暂停滞），设备仍可用，
-      // 不升级为重建，仅记录一次。
-      LogFailureOnce(L"copy offscreen -> backbuffer", cr);
-      return FrameResult::Failed;
-    }
-  }
-
-  // Present(0)：不等待 vsync，提交时机由调用方按 DWM 合成时钟对齐（见 main.cpp），
-  // 使帧赶在当前这次合成之前交上去，而不是由 DWM 等到下一次 vsync。
-  const HRESULT pr = swapChain_->Present(0, 0);
-  if (IsDeviceLost(pr)) {
-    LogHr(L"Present (device lost)", pr);
-    return FrameResult::RecreateDevice;
-  }
-  if (FAILED(pr)) {  // DXGI_STATUS_OCCLUDED 是成功码，不在此列
-    LogFailureOnce(L"Present", pr);
-    return FrameResult::Failed;
-  }
-
-  loggedFailure_ = false;  // 连续多帧成功后重新武装失败日志
+  loggedFailure_ = false;
+  if (committed) *committed = true;
   return FrameResult::Ok;
+}
+
+void OverlayRenderer::HideAll() {
+  if (!initialized_ || !dcompDevice_) return;
+  bool dirty = false;
+  if (headVisible_) {
+    headVisible_ = false;
+    head3_->SetVisible(FALSE);
+    dirty = true;
+  }
+  for (auto& slot : slots_) {
+    if (slot.visible) {
+      slot.visible = false;
+      slot.visual3->SetVisible(FALSE);
+      dirty = true;
+    }
+  }
+  live_ = 0;
+  nextSlot_ = 0;
+  if (dirty) dcompDevice_->Commit();  // 尽力而为：失败由看门狗/下次 Update 兜住
 }
