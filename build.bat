@@ -80,6 +80,6 @@ if "%USING_NINJA%"=="1" (
 )
 echo.
 echo Build OK: %OUT_EXE%
-echo Run:     %OUT_EXE% [--hide-cursor]
+echo Run:     %OUT_EXE%
 echo Quit:    Ctrl+Alt+Q
 endlocal

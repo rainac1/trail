@@ -6,9 +6,9 @@
 
 // 光标位图：premultiplied BGRA（32bpp）。
 //
-// 视觉树方案里这份位图不是"每帧画的纹理"，而是**唯一一份**内容：上传到一张小的
+// 视觉树方案里这份位图不是"每次事件重画的纹理"，而是**唯一一份**内容：上传到一张小的
 // DirectComposition surface 后被所有采样点视觉共享。于是运行期的热路径上没有任何
-// 像素操作，只有 visual 的 offset/opacity 变化 —— 见 overlay_renderer.h。
+// 像素操作，只有 visual 的 offset / visible 变化 —— 见 overlay_renderer.h。
 struct CursorBitmap {
   int width = 0;
   int height = 0;

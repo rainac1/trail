@@ -5,9 +5,9 @@
 #include <share.h>
 
 namespace {
-// 日志状态。当前不变式：DiagLog/DiagFatal 仅由主线程调用（采样线程不写日志），
-// DiagClose 在采样线程 join 之后执行，因此不存在并发访问；g_log 检查与使用之间
-// 无 TOCTOU。若未来允许其他线程写日志，需在此加 CRITICAL_SECTION 保护。
+// 日志状态。当前不变式：DiagLog/DiagFatal 仅由主线程调用（消息循环与 WH_MOUSE_LL
+// 回调同线程），DiagClose 在钩子卸载、循环退出之后执行，因此不存在并发访问；g_log
+// 检查与使用之间无 TOCTOU。若未来允许其他线程写日志，需在此加 CRITICAL_SECTION 保护。
 FILE* g_log = nullptr;
 bool g_noUi = false;
 wchar_t g_logPath[MAX_PATH] = {};

@@ -3,7 +3,6 @@ project(trail LANGUAGES CXX)
 
 add_executable(trail WIN32
   src/main.cpp
-  src/mouse_history.cpp
   src/cursor_texture.cpp
   src/diag.cpp
   src/overlay_renderer.cpp
@@ -23,7 +22,4 @@ else()
   target_compile_options(trail PRIVATE $<$<CONFIG:Release>:-O3>)
 endif()
 
-# d2d1 / winmm 已不再需要：尾迹由 DirectComposition 视觉树直接合成，没有 D2D 绘制，
-# 也不再使用 timeBeginPeriod 这类全局定时器分辨率接口。dwmapi 只在运行时用
-# GetProcAddress 查 DwmIsCompositionEnabled，不需要导入库。
 target_link_libraries(trail PRIVATE d3d11 dxgi dcomp)

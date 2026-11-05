@@ -142,7 +142,7 @@ bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, in
   }
   qpcFreq_ = static_cast<uint64_t>(freq.QuadPart);
 
-  // 仅使用硬件加速设备（WARP 软件渲染不满足延迟目标）。
+  // 仅使用硬件加速设备。
   const UINT deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
   HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags, nullptr,
@@ -215,24 +215,6 @@ bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, in
     slots_.push_back(std::move(slot));
   }
 
-  // 头部视觉最后加入 => 位于所有尾迹点之上。
-  hr = dcompDevice_->CreateVisual(&head_);
-  if (FAILED(hr)) {
-    LogHr(L"CreateVisual(head)", hr);
-    return false;
-  }
-  hr = head_.As(&head3_);
-  if (FAILED(hr)) {
-    LogHr(L"head->IDCompositionVisual3 QI (Windows 10+ required)", hr);
-    return false;
-  }
-  head3_->SetVisible(FALSE);
-  hr = root_->AddVisual(head_.Get(), FALSE, nullptr);
-  if (FAILED(hr)) {
-    LogHr(L"AddVisual(head)", hr);
-    return false;
-  }
-
   hr = dcompDevice_->Commit();
   if (FAILED(hr)) {
     LogHr(L"Commit (init)", hr);
@@ -241,10 +223,9 @@ bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, in
 
   nextSlot_ = 0;
   live_ = 0;
-  headVisible_ = false;
   loggedFailure_ = false;
   initialized_ = true;
-  DiagLog(L"[OverlayRenderer] initialized: %d sprite visuals + head, DirectComposition visual tree",
+  DiagLog(L"[OverlayRenderer] initialized: %d sprite visuals, DirectComposition visual tree",
           maxSprites);
   return true;
 }
@@ -254,8 +235,6 @@ void OverlayRenderer::Shutdown() {
   // 避免 DWM 仍引用已释放的内容。
   if (target_) target_->SetRoot(nullptr);
   slots_.clear();
-  head3_.Reset();
-  head_.Reset();
   root_.Reset();
   target_.Reset();
   spriteSurface_.Reset();
@@ -265,7 +244,6 @@ void OverlayRenderer::Shutdown() {
 
   live_ = 0;
   nextSlot_ = 0;
-  headVisible_ = false;
   spriteW_ = 0;
   spriteH_ = 0;
   hotX_ = 0;
@@ -374,24 +352,13 @@ bool OverlayRenderer::SetCursorBitmap(const CursorBitmap& bmp) {
     slot.visible = false;
     slot.bornQpc = 0;
   }
-  head_->SetContent(spriteSurface_.Get());
-  head3_->SetVisible(FALSE);
-  headVisible_ = false;
   live_ = 0;
   nextSlot_ = 0;
-  lastHeadX_ = 0;
-  lastHeadY_ = 0;
 
-  hr = dcompDevice_->Commit();
-  if (FAILED(hr)) {
-    LogHr(L"Commit (sprite)", hr);
-    return false;
-  }
-  return true;
+  return CommitNow(nullptr) == FrameResult::Ok;
 }
 
 OverlayRenderer::FrameResult OverlayRenderer::Update(const Sample* samples, uint32_t count,
-                                                     int headX, int headY, bool showHead,
                                                      bool* committed) {
   if (committed) *committed = false;
   if (!initialized_) return FrameResult::RecreateDevice;
@@ -429,43 +396,20 @@ OverlayRenderer::FrameResult OverlayRenderer::Update(const Sample* samples, uint
   }
 
   // ---- 过期：时间窗之外的采样点隐藏。这就是"擦除"，它只是一次 SetVisible(FALSE)。----
-  if (trailTicks_ > 0 && live_ > 0) {
-    for (auto& slot : slots_) {
-      if (slot.visible && (now - slot.bornQpc) > trailTicks_) {
-        slot.visible = false;
-        --live_;
-        slot.visual3->SetVisible(FALSE);
-        dirty = true;
-      }
-    }
-  }
-
-  // ---- 头部：只在 --hide-cursor 模式下显示（系统光标可见时它被硬件光标完全遮住）。----
-  const bool headInside = showHead && headX >= rect_.left && headX < rect_.right &&
-                          headY >= rect_.top && headY < rect_.bottom;
-  if (headInside) {
-    if (!headVisible_ || headX != lastHeadX_ || headY != lastHeadY_) {
-      head_->SetOffsetX(static_cast<float>(headX - rect_.left - hotX_));
-      head_->SetOffsetY(static_cast<float>(headY - rect_.top - hotY_));
-      lastHeadX_ = headX;
-      lastHeadY_ = headY;
-      if (!headVisible_) {
-        headVisible_ = true;
-        head3_->SetVisible(TRUE);
-      }
-      dirty = true;
-    }
-  } else if (headVisible_) {
-    headVisible_ = false;
-    head3_->SetVisible(FALSE);
-    dirty = true;
-  }
+  if (HideExpired(now)) dirty = true;
 
   if (!dirty) return FrameResult::Ok;  // 静止且无过期：一个 COM 调用都不做
+  return CommitNow(committed);
+}
+
+OverlayRenderer::FrameResult OverlayRenderer::CommitNow(bool* committed) {
+  if (committed) *committed = false;
+  if (!initialized_ || !dcompDevice_) return FrameResult::RecreateDevice;
 
   const uint64_t commitStart = QpcNow();
   const HRESULT hr = dcompDevice_->Commit();
   lastCommitTicks_ = QpcNow() - commitStart;
+
   if (IsDeviceLost(hr)) {
     LogHr(L"Commit (device lost)", hr);
     return FrameResult::RecreateDevice;
@@ -479,14 +423,42 @@ OverlayRenderer::FrameResult OverlayRenderer::Update(const Sample* samples, uint
   return FrameResult::Ok;
 }
 
+bool OverlayRenderer::HideExpired(uint64_t now) {
+  if (trailTicks_ == 0 || live_ == 0) return false;
+  bool dirty = false;
+  for (auto& slot : slots_) {
+    if (!slot.visible) continue;
+    if (now - slot.bornQpc >= trailTicks_) {
+      slot.visible = false;
+      --live_;
+      slot.visual3->SetVisible(FALSE);
+      dirty = true;
+    }
+  }
+  return dirty;
+}
+
+uint64_t OverlayRenderer::NextExpiryQpc() const {
+  if (!initialized_ || trailTicks_ == 0 || live_ == 0) return 0;
+  uint64_t earliest = 0;
+  for (const auto& slot : slots_) {
+    if (!slot.visible) continue;
+    const uint64_t when = slot.bornQpc + trailTicks_;
+    if (earliest == 0 || when < earliest) earliest = when;
+  }
+  return earliest;
+}
+
+OverlayRenderer::FrameResult OverlayRenderer::Expire(uint64_t now, bool* committed) {
+  if (committed) *committed = false;
+  if (!initialized_ || !dcompDevice_) return FrameResult::RecreateDevice;
+  if (!HideExpired(now)) return FrameResult::Ok;
+  return CommitNow(committed);
+}
+
 void OverlayRenderer::HideAll() {
   if (!initialized_ || !dcompDevice_) return;
   bool dirty = false;
-  if (headVisible_) {
-    headVisible_ = false;
-    head3_->SetVisible(FALSE);
-    dirty = true;
-  }
   for (auto& slot : slots_) {
     if (slot.visible) {
       slot.visible = false;
@@ -496,5 +468,5 @@ void OverlayRenderer::HideAll() {
   }
   live_ = 0;
   nextSlot_ = 0;
-  if (dirty) dcompDevice_->Commit();  // 尽力而为：失败由看门狗/下次 Update 兜住
+  if (dirty) CommitNow(nullptr);  // 尽力而为：失败由看门狗/下次 Update 兜住
 }
