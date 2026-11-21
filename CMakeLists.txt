@@ -5,6 +5,7 @@ add_executable(trail WIN32
   src/main.cpp
   src/cursor_texture.cpp
   src/diag.cpp
+  src/frame_guard.cpp
   src/overlay_renderer.cpp
 )
 
@@ -22,4 +23,4 @@ else()
   target_compile_options(trail PRIVATE $<$<CONFIG:Release>:-O3>)
 endif()
 
-target_link_libraries(trail PRIVATE d3d11 dxgi dcomp)
+target_link_libraries(trail PRIVATE d3d11 dxgi dcomp dwmapi)

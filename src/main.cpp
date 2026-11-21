@@ -29,6 +29,7 @@
 
 #include "cursor_texture.h"
 #include "diag.h"
+#include "frame_guard.h"
 #include "mouse_sample.h"
 #include "overlay_renderer.h"
 
@@ -51,6 +52,7 @@ enum class CreateOverlayStatus {
 };
 
 OverlayRenderer g_renderer;
+FrameGuard g_frameGuard;
 HCURSOR g_cursorHandle = nullptr;  // 已上传到渲染器的光标句柄（nullptr = 需要重抓）
 uint64_t g_nextCursorRetryTicks = 0;
 bool g_cursorCaptureFailureLogged = false;
@@ -115,7 +117,6 @@ void PrintUsage() {
   wprintf(
       L"Trail\n"
       L"Usage: trail.exe [options]\n"
-      L"  --trail-ms <ms>    trail lifetime in milliseconds (default 8.0)\n"
       L"  --sprites <n>      max concurrently visible sample sprites (default 64)\n"
       L"  --log              write diagnostic log to trail.log next to trail.exe\n"
       L"  --help             show this help\n"
@@ -232,8 +233,9 @@ void EnsureTopmost(HWND hwnd) {
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
 }
 
-void RecordCommit() {
+void RecordCommit(uint64_t now) {
   ++g_statCommits;
+  g_frameGuard.NotifyCommit(now);
   if (!DiagLogEnabled()) return;
   const double us = TicksToUs(g_renderer.lastCommitTicks());
   g_statCommitUsSum += us;
@@ -286,7 +288,7 @@ void FlushPendingSamples(uint64_t now) {
     --g_pendingCount;
   }
 
-  if (!g_renderer.ready() || g_deviceLost) return;
+  if (!g_renderer.ready() || g_deviceLost || g_frameGuard.paused()) return;
 
   CURSORINFO ci{};
   ci.cbSize = sizeof(ci);
@@ -313,7 +315,7 @@ void FlushPendingSamples(uint64_t now) {
 
   bool committed = false;
   const OverlayRenderer::FrameResult fr = g_renderer.Update(filtered, count, now, &committed);
-  if (committed) RecordCommit();
+  if (committed) RecordCommit(now);
   if (fr == OverlayRenderer::FrameResult::RecreateDevice) g_deviceLost = true;
   g_statSamples += count;
 }
@@ -351,7 +353,7 @@ bool InstallMouseHook() {
 // 没有鼠标事件时对账光标状态：应用调用 ShowCursor / SetCursorPos 不会产生鼠标钩子。
 // 第一次对账（启动后还没有任何鼠标事件）只建立位置基准，不凭空产生采样点。
 void ReconcileCursor(uint64_t now) {
-  if (!g_renderer.ready() || g_deviceLost) return;
+  if (!g_renderer.ready() || g_deviceLost || g_frameGuard.paused()) return;
   CURSORINFO ci{};
   ci.cbSize = sizeof(ci);
   if (!GetCursorInfo(&ci) || (ci.flags & CURSOR_SHOWING) == 0 || !ci.hCursor) {
@@ -378,7 +380,7 @@ void ReconcileCursor(uint64_t now) {
   const Sample sample{static_cast<int32_t>(x), static_cast<int32_t>(y), now};
   bool committed = false;
   const OverlayRenderer::FrameResult fr = g_renderer.Update(&sample, 1, now, &committed);
-  if (committed) RecordCommit();
+  if (committed) RecordCommit(now);
   if (fr == OverlayRenderer::FrameResult::RecreateDevice) g_deviceLost = true;
   ++g_statSamples;
 }
@@ -446,10 +448,10 @@ void LogStats(uint64_t now) {
   const double events = static_cast<double>(g_statEvents);
   const double commits = static_cast<double>(g_statCommits);
   DiagLog(L"[update] events=%.1f/s samples=%.1f/s commits=%.1f/s live=%d | "
-          L"commit mean=%.1f max=%.1f us",
+          L"commit mean=%.1f max=%.1f us | frame=%.2f ms paused=%d",
           events / secs, static_cast<double>(g_statSamples) / secs, commits / secs,
           g_renderer.liveSprites(), commits > 0.0 ? g_statCommitUsSum / commits : 0.0,
-          g_statCommitUsMax);
+          g_statCommitUsMax, g_frameGuard.lastMeasuredMs(), g_frameGuard.paused() ? 1 : 0);
 
   g_statWindowStart = now;
   g_statEvents = 0;
@@ -529,7 +531,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   }
 
   // ---- 命令行参数 ----
-  double trailMs = 8.0;
   int maxSprites = 64;
   bool enableLog = false;
   for (int i = 1; i < __argc; ++i) {
@@ -538,9 +539,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     if (wcscmp(a, L"--help") == 0) {
       PrintUsage();
       return 0;
-    } else if (wcscmp(a, L"--trail-ms") == 0 && value) {
-      trailMs = wcstod(value, nullptr);
-      ++i;
     } else if (wcscmp(a, L"--sprites") == 0 && value) {
       maxSprites = static_cast<int>(wcstol(value, nullptr, 10));
       ++i;
@@ -548,8 +546,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
       enableLog = true;
     }
   }
-  if (!(trailMs >= 0.5)) trailMs = 0.5;
-  if (trailMs > 5000.0) trailMs = 5000.0;
   if (maxSprites < 1) maxSprites = 1;
   if (maxSprites > 512) maxSprites = 512;
 
@@ -580,6 +576,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
   g_instance = hInstance;
 
+  g_frameGuard.Initialize(g_qpcFreq);
+  const double trailMs = g_frameGuard.baselineMs();
+
   WNDCLASSEXW wc{};
   wc.cbSize = sizeof(wc);
   wc.lpfnWndProc = WndProc;
@@ -604,8 +603,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
               L"可加 --log 参数记录具体失败步骤。");
     return cleanupExit(1);
   }
-  DiagLog(L"[main] renderer ready: trail=%.1f ms, sprites=%d, input=WH_MOUSE_LL", trailMs,
-          maxSprites);
+  DiagLog(L"[main] renderer ready: trail=%.3f ms (auto 1-frame), sprites=%d, input=WH_MOUSE_LL",
+          trailMs, maxSprites);
 
   // 采样点到期 / 看门狗用的高分辨率定时器（Windows 10 1803+）。拿不到就退回毫秒超时。
   g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -653,16 +652,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
 
     const uint64_t now = QpcNow();
 
+    // ---- 帧时间守卫：被动消费 DWM 已完成帧，偏离启动基准时清空尾迹并停 Commit ----
+    if (g_frameGuard.Poll() && g_frameGuard.paused()) {
+      HideCursorVisuals();
+    }
+
     // ---- 批量提交本轮钩子采集的采样点 ----
     FlushPendingSamples(now);
 
     // ---- 采样点到期：定时器把我们从等待中叫醒，隐藏已经过期的槽位 ----
-    if (g_renderer.ready() && !g_deviceLost) {
+    if (g_renderer.ready() && !g_deviceLost && !g_frameGuard.paused()) {
       const uint64_t expiry = g_renderer.NextExpiryQpc();
       if (expiry != 0 && now >= expiry) {
         bool committed = false;
         const OverlayRenderer::FrameResult fr = g_renderer.Expire(now, &committed);
-        if (committed) RecordCommit();
+        if (committed) RecordCommit(now);
         if (fr == OverlayRenderer::FrameResult::RecreateDevice) g_deviceLost = true;
       }
     }
@@ -673,6 +677,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
         DiagLog(L"[recover] rebuilding after device loss");
         if (InitRenderer(maxSprites, trailMs)) {
           DiagLog(L"[recover] renderer rebuilt");
+          g_frameGuard.ResetSession();
           g_deviceLost = false;
           nextRecreate = 0;
           recreateBackoffMs = kRecreateInitialBackoffMs;
