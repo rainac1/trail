@@ -1,45 +1,67 @@
 #include "diag.h"
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <share.h>
 
 namespace {
-// 日志状态。当前不变式：DiagLog/DiagFatal 仅由主线程调用（消息循环与 WH_MOUSE_LL
-// 回调同线程），DiagClose 在钩子卸载、循环退出之后执行，因此不存在并发访问；g_log
-// 检查与使用之间无 TOCTOU。若未来允许其他线程写日志，需在此加 CRITICAL_SECTION 保护。
+// 日志状态。当前不变式：仅由主线程调用（消息循环与初始化/退出同线程），无并发访问。
 FILE* g_log = nullptr;
+bool g_logEnabled = false;
+bool g_logAttempted = false;
 bool g_noUi = false;
 wchar_t g_logPath[MAX_PATH] = {};
-}  // namespace
 
-static void OpenLog() {
-  if (g_log) return;
+void OpenLog() {
+  if (!g_logEnabled || g_logAttempted) return;
+  g_logAttempted = true;
+
   const DWORD n = GetModuleFileNameW(nullptr, g_logPath, MAX_PATH);
-  if (n == 0 || n >= MAX_PATH) return;
+  if (n == 0 || n >= MAX_PATH) {
+    g_logPath[0] = L'\0';
+    return;
+  }
+  constexpr wchar_t kLogName[] = L"trail.log";
+  constexpr size_t kLogNameLen = sizeof(kLogName) / sizeof(kLogName[0]);
   wchar_t* slash = wcsrchr(g_logPath, L'\\');
-  if (slash) wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - g_logPath),
-                      L"trail.log");
-  // _SH_DENYWR：允许其他进程读取日志。用 _wfopen_s 的默认共享模式会独占文件，
-  // 导致"渲染消失"时无法在程序仍运行的情况下查看日志 —— 而杀掉进程就销毁了现场。
+  if (!slash) {
+    g_logPath[0] = L'\0';
+    return;
+  }
+  const size_t remain = MAX_PATH - static_cast<size_t>(slash + 1 - g_logPath);
+  if (remain < kLogNameLen) {
+    g_logPath[0] = L'\0';
+    return;
+  }
+  wcscpy_s(slash + 1, remain, kLogName);
+
+  // _SH_DENYWR：允许其他进程在程序运行期间读取日志。
   g_log = _wfsopen(g_logPath, L"a, ccs=UTF-8", _SH_DENYWR);
   if (g_log) {
-    fwprintf(g_log, L"\n===== %ls =====\n", L"--- session ---");
+    fwprintf(g_log, L"\n===== --- session --- =====\n");
     fflush(g_log);
   }
 }
 
-void DiagInit() {
-  OpenLog();
+}  // namespace
+
+void DiagInit(bool enableFileLog) {
+  g_logEnabled = enableFileLog;
   // 仅当变量值为 "1" 时才禁用弹窗（避免 "0"/"false" 误触发）。
   wchar_t buf[2] = {};
-  // TRAIL_NO_UI=1 禁用弹窗；旧名 SUBFRAME_NO_UI 仍兼容（项目重命名前遗留）。
-  g_noUi = (GetEnvironmentVariableW(L"TRAIL_NO_UI", buf, 2) > 0 && buf[0] == L'1') ||
-           (GetEnvironmentVariableW(L"SUBFRAME_NO_UI", buf, 2) > 0 && buf[0] == L'1');
+  g_noUi = (GetEnvironmentVariableW(L"TRAIL_NO_UI", buf, 2) > 0 && buf[0] == L'1');
+  if (g_logEnabled) OpenLog();
+}
+
+bool DiagLogEnabled() {
+  return g_logEnabled;
 }
 
 void DiagLog(const wchar_t* fmt, ...) {
+  if (!g_logEnabled) return;
   OpenLog();
+
   va_list args;
   va_start(args, fmt);
   if (g_log) {
@@ -56,8 +78,20 @@ void DiagLog(const wchar_t* fmt, ...) {
 }
 
 void DiagFatal(const wchar_t* title, const wchar_t* msg) {
-  DiagLog(L"FATAL: %ls", msg);
-  if (!g_noUi) MessageBoxW(nullptr, msg, title, MB_OK | MB_ICONERROR);
+  if (g_logEnabled) {
+    DiagLog(L"FATAL: %ls", msg);
+  } else {
+    fwprintf(stderr, L"FATAL: %ls\n", msg);
+  }
+  if (g_noUi) return;
+
+  if (g_log && g_logPath[0]) {
+    wchar_t full[768];
+    swprintf_s(full, L"%ls\n\n诊断日志: %ls", msg, g_logPath);
+    MessageBoxW(nullptr, full, title, MB_OK | MB_ICONERROR);
+  } else {
+    MessageBoxW(nullptr, msg, title, MB_OK | MB_ICONERROR);
+  }
 }
 
 void DiagClose() {
@@ -65,9 +99,6 @@ void DiagClose() {
     fclose(g_log);
     g_log = nullptr;
   }
-}
-
-const wchar_t* DiagLogPath() {
-  OpenLog();
-  return g_logPath[0] ? g_logPath : L"<unknown>";
+  g_logEnabled = false;
+  g_logAttempted = false;
 }
