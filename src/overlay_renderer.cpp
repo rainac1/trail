@@ -43,11 +43,7 @@ void LogAdapterDiagnostics(ID3D11Device* device) {
 // 系统光标在给定 DPI 下的像素尺寸（物理像素）。系统按 DPI 缩放绘制光标，但
 // GetCursorInfo/CopyIcon 给的是原生位图，所以这就是我们要缩放到的目标尺寸。
 int CursorMetricForDpi(int index, UINT dpi) {
-  using GetSystemMetricsForDpiFn = int(WINAPI*)(int, UINT);
-  static const auto fn = reinterpret_cast<GetSystemMetricsForDpiFn>(
-      GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi"));
-  if (fn) return fn(index, dpi);
-  return MulDiv(GetSystemMetrics(index), static_cast<int>(dpi), 96);
+  return GetSystemMetricsForDpi(index, dpi);
 }
 
 uint8_t ClampByte(double v) {
@@ -205,7 +201,7 @@ bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, in
     Slot slot;
     hr = baseVisual.As(&slot.visual);
     if (FAILED(hr)) {
-      LogHr(L"visual->IDCompositionVisual3 QI (Windows 10+ required)", hr);
+      LogHr(L"visual->IDCompositionVisual3 QI", hr);
       return fail();
     }
     slot.visual->SetContent(spriteSurface_.Get());

@@ -14,7 +14,7 @@ drops), it hides the trail and pauses commits until timing returns to the baseli
 
 ## Build
 
-Requirements: Windows 10+, Visual Studio 2017+ ("Desktop development with C++"), CMake 3.16+.
+Requirements: Windows 11 (21H2+), Visual Studio 2022+ ("Desktop development with C++" with Windows 11 SDK 10.0.22000+), CMake 3.16+.
 
 ```bat
 build.bat            REM Release

@@ -10,8 +10,14 @@ add_executable(trail WIN32
 )
 
 target_compile_features(trail PRIVATE cxx_std_17)
+# 最低支持 Windows 11 21H2（NTDDI_WIN10_CO = 0x0A00000B，启用 DirectComposition 帧统计 API）。
 # NOMINMAX：windows.h 默认把 min/max 定义成宏，会和 <algorithm> 的 std::min/std::max 打架。
-target_compile_definitions(trail PRIVATE WINVER=0x0A00 _WIN32_WINNT=0x0A00 NOMINMAX)
+target_compile_definitions(trail PRIVATE
+  WINVER=0x0A00
+  _WIN32_WINNT=0x0A00
+  NTDDI_VERSION=0x0A00000B
+  NOMINMAX
+)
 
 if(MSVC)
   # 注意：不要无条件加 /O2 —— Debug 配置（/Od /RTC1）会与之冲突，
@@ -23,4 +29,4 @@ else()
   target_compile_options(trail PRIVATE $<$<CONFIG:Release>:-O3>)
 endif()
 
-target_link_libraries(trail PRIVATE d3d11 dxgi dcomp dwmapi)
+target_link_libraries(trail PRIVATE d3d11 dxgi dcomp)

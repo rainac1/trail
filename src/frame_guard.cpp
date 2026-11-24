@@ -1,7 +1,6 @@
 #include "frame_guard.h"
 
 #include <dcomp.h>
-#include <dwmapi.h>
 
 #include <algorithm>
 #include <vector>
@@ -10,67 +9,19 @@
 
 namespace {
 
-// 兼容较旧的 Windows 10 SDK（未定义 Win11 Compositor Statistics 结构体时提供同 ABI 定义）。
-#ifndef COMPOSITION_STATS_MAX_TARGETS
-enum COMPOSITION_FRAME_ID_TYPE {
-  COMPOSITION_FRAME_ID_CREATED = 0,
-  COMPOSITION_FRAME_ID_CONFIRMED = 1,
-  COMPOSITION_FRAME_ID_COMPLETED = 2,
-};
-
-using COMPOSITION_FRAME_ID = ULONG64;
-
-struct COMPOSITION_FRAME_STATS {
-  UINT64 startTime;
-  UINT64 targetTime;
-  UINT64 framePeriod;
-};
-
-struct COMPOSITION_TARGET_ID {
-  LUID displayAdapterLuid;
-  LUID renderAdapterLuid;
-  UINT vidPnSourceId;
-  UINT vidPnTargetId;
-  UINT uniqueId;
-};
-
-struct COMPOSITION_STATS {
-  UINT presentCount;
-  UINT refreshCount;
-  UINT virtualRefreshCount;
-  UINT64 time;
-};
-
-struct COMPOSITION_TARGET_STATS {
-  UINT outstandingPresents;
-  UINT64 presentTime;
-  UINT64 vblankDuration;
-  COMPOSITION_STATS presentedStats;
-  COMPOSITION_STATS completedStats;
-};
-#endif
-
-using GetFrameIdFn = HRESULT(STDAPICALLTYPE*)(COMPOSITION_FRAME_ID_TYPE, COMPOSITION_FRAME_ID*);
-using GetStatisticsFn = HRESULT(STDAPICALLTYPE*)(COMPOSITION_FRAME_ID, COMPOSITION_FRAME_STATS*,
-                                                 UINT, COMPOSITION_TARGET_ID*, UINT*);
-using GetTargetStatisticsFn = HRESULT(STDAPICALLTYPE*)(COMPOSITION_FRAME_ID,
-                                                       const COMPOSITION_TARGET_ID*,
-                                                       COMPOSITION_TARGET_STATS*);
-
 constexpr uint64_t kMaxFramesPerPoll = 64;
-constexpr int kPauseMildThreshold = 2;      // 轻微偏离：2 帧即停（且需连续 4 帧正常才衰减 1）
-constexpr int kBadDecayStreak = 4;          // 防止 50% 交替掉帧把 badScore 来回清零
-constexpr int kResumeGoodSamples = 6;       // 恢复需连续 6 个正常样本（且过完冷却期）
+constexpr int kTimingPauseThreshold = 4;     // VRR/帧周期异常：严重偏离(+2)需 2 帧，轻微(+1)需 4 帧，拒绝单帧毛刺
+constexpr int kTimingDecayStreak = 2;        // 连续 2 个正常帧衰减 1 分（仍能抓住 50% 交替抖动）
+constexpr int kDropPauseThreshold = 6;       // 持续 DWM 掉帧：连续 6 帧 dRef=2（~100ms）或 3 帧 dRef>=3 才暂停
+constexpr int kDropDecayStreak = 2;          // 连续 2 个无掉帧样本衰减 1 分，避免偶发单帧跳过触发暂停
+constexpr uint32_t kCleanIdleResetRefs = 12; // 跨越 >=12 次正常刷新后清零陈旧的历史计分
+constexpr int kResumeGoodSamples = 6;        // 活跃桌面恢复需连续 6 个正常样本（且过完冷却期）
+constexpr int kResumeMinSamplesForSpan = 2;  // 静止桌面帧稀疏时：至少 2 个正常样本且覆盖 >=24 次刷新即可恢复
+constexpr uint64_t kResumeGoodRefreshes = 24;
 constexpr uint64_t kInitialHoldoffMs = 500;
-constexpr uint64_t kMaxHoldoffMs = 8000;
-constexpr uint64_t kRapidRetripWindowMs = 3000;
+constexpr uint64_t kMaxHoldoffMs = 4000;
+constexpr uint64_t kRapidRetripWindowMs = 2000;
 constexpr UINT kStackTargetLimit = 16;
-
-uint64_t QpcNow() {
-  LARGE_INTEGER t;
-  QueryPerformanceCounter(&t);
-  return static_cast<uint64_t>(t.QuadPart);
-}
 
 uint64_t AbsDiff(uint64_t a, uint64_t b) {
   return (a >= b) ? (a - b) : (b - a);
@@ -96,24 +47,6 @@ bool IsSanePeriodTicks(uint64_t ticks, uint64_t qpcFreq) {
 
 double FrameGuard::baselineMs() const {
   return TicksToMs(baselineTicks_, qpcFreq_);
-}
-
-void FrameGuard::LoadDcompStatsApi() {
-  fnGetFrameId_ = nullptr;
-  fnGetStatistics_ = nullptr;
-  fnGetTargetStatistics_ = nullptr;
-  hasDcompStats_ = false;
-
-  // dcomp.lib 已静态链接，进程启动后 dcomp.dll 就在地址空间内；用 GetModuleHandleW 优先取句柄。
-  HMODULE dcomp = GetModuleHandleW(L"dcomp.dll");
-  if (!dcomp) dcomp = LoadLibraryW(L"dcomp.dll");
-  if (!dcomp) return;
-
-  fnGetFrameId_ = reinterpret_cast<void*>(GetProcAddress(dcomp, "DCompositionGetFrameId"));
-  fnGetStatistics_ = reinterpret_cast<void*>(GetProcAddress(dcomp, "DCompositionGetStatistics"));
-  fnGetTargetStatistics_ =
-      reinterpret_cast<void*>(GetProcAddress(dcomp, "DCompositionGetTargetStatistics"));
-  hasDcompStats_ = (fnGetFrameId_ && fnGetStatistics_ && fnGetTargetStatistics_);
 }
 
 uint64_t FrameGuard::QueryPrimaryDisplayConfig(PrimaryTarget& outTarget) const {
@@ -167,15 +100,10 @@ uint64_t FrameGuard::QueryPrimaryDisplayConfig(PrimaryTarget& outTarget) const {
 }
 
 bool FrameGuard::ReadCompletedFrame(uint64_t frameId, CompletedFrame& out) const {
-  if (!hasDcompStats_) return false;
-  const auto fnGetStatistics = reinterpret_cast<GetStatisticsFn>(fnGetStatistics_);
-  const auto fnGetTargetStatistics =
-      reinterpret_cast<GetTargetStatisticsFn>(fnGetTargetStatistics_);
-
   COMPOSITION_FRAME_STATS fs{};
   COMPOSITION_TARGET_ID tids[kStackTargetLimit]{};
   UINT actualTargets = 0;
-  HRESULT hr = fnGetStatistics(frameId, &fs, kStackTargetLimit, tids, &actualTargets);
+  HRESULT hr = DCompositionGetStatistics(frameId, &fs, kStackTargetLimit, tids, &actualTargets);
   if (FAILED(hr) || actualTargets == 0) return false;
 
   const UINT count = std::min(actualTargets, kStackTargetLimit);
@@ -195,7 +123,7 @@ bool FrameGuard::ReadCompletedFrame(uint64_t frameId, CompletedFrame& out) const
   if (matched >= count) return false;
 
   COMPOSITION_TARGET_STATS ts{};
-  hr = fnGetTargetStatistics(frameId, &tids[matched], &ts);
+  hr = DCompositionGetTargetStatistics(frameId, &tids[matched], &ts);
   if (FAILED(hr)) return false;
 
   // 部分 DWM 合成帧未在目标显示器触发实际 present，其 completedStats 为全零，需过滤。
@@ -211,37 +139,24 @@ bool FrameGuard::ReadCompletedFrame(uint64_t frameId, CompletedFrame& out) const
 uint64_t FrameGuard::ProbeInitialPeriodTicks(uint64_t nominalTicks) {
   uint64_t measuredTicks = 0;
 
-  if (hasDcompStats_) {
-    const auto fnGetFrameId = reinterpret_cast<GetFrameIdFn>(fnGetFrameId_);
-    COMPOSITION_FRAME_ID latest = 0;
-    if (SUCCEEDED(fnGetFrameId(COMPOSITION_FRAME_ID_COMPLETED, &latest)) && latest > 0) {
-      lastFrameId_ = latest;
-      hasLastFrameId_ = true;
+  COMPOSITION_FRAME_ID latest = 0;
+  if (SUCCEEDED(DCompositionGetFrameId(COMPOSITION_FRAME_ID_COMPLETED, &latest)) && latest > 0) {
+    lastFrameId_ = latest;
+    hasLastFrameId_ = true;
 
-      // 从最新完成帧往前最多找 16 帧，取主屏最近一个有效帧作为晶振校准与游标起点。
-      const uint64_t minId = (latest > 16) ? (latest - 15) : 1;
-      for (uint64_t fid = latest; fid >= minId; --fid) {
-        CompletedFrame frame{};
-        if (ReadCompletedFrame(fid, frame)) {
-          prevFrame_ = frame;
-          hasPrevFrame_ = true;
-          if (IsSanePeriodTicks(frame.vblankDuration, qpcFreq_)) {
-            measuredTicks = frame.vblankDuration;
-          }
-          break;
+    // 从最新完成帧往前最多找 16 帧，取主屏最近一个有效帧作为晶振校准与游标起点。
+    const uint64_t minId = (latest > 16) ? (latest - 15) : 1;
+    for (uint64_t fid = latest; fid >= minId; --fid) {
+      CompletedFrame frame{};
+      if (ReadCompletedFrame(fid, frame)) {
+        prevFrame_ = frame;
+        hasPrevFrame_ = true;
+        if (IsSanePeriodTicks(frame.vblankDuration, qpcFreq_)) {
+          measuredTicks = frame.vblankDuration;
         }
-        if (fid == 1) break;
+        break;
       }
-    }
-  }
-
-  // Win10 或启动时 DComp 尚无主屏历史帧：退回 DwmGetCompositionTimingInfo::qpcRefreshPeriod。
-  if (measuredTicks == 0) {
-    DWM_TIMING_INFO ti{};
-    ti.cbSize = sizeof(ti);
-    if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) &&
-        IsSanePeriodTicks(ti.qpcRefreshPeriod, qpcFreq_)) {
-      measuredTicks = ti.qpcRefreshPeriod;
+      if (fid == 1) break;
     }
   }
 
@@ -265,8 +180,10 @@ bool FrameGuard::Initialize(uint64_t qpcFreq) {
   qpcFreq_ = qpcFreq;
 
   paused_ = false;
-  badScore_ = 0;
-  activeCleanStreak_ = 0;
+  timingBadScore_ = 0;
+  timingCleanStreak_ = 0;
+  dropBadScore_ = 0;
+  dropCleanStreak_ = 0;
   goodSamples_ = 0;
   goodRefreshes_ = 0;
   pausedAtTime_ = 0;
@@ -281,21 +198,31 @@ bool FrameGuard::Initialize(uint64_t qpcFreq) {
   lastMeasuredMs_ = 0.0;
   pauseCount_ = 0;
 
-  LoadDcompStatsApi();
   const uint64_t nominalTicks = QueryPrimaryDisplayConfig(primaryTarget_);
   baselineTicks_ = ProbeInitialPeriodTicks(nominalTicks);
 
-  // 非对称灵敏度：
-  //   - 单帧轻微偏离：±8%（至少 0.50ms），2 帧触发；
-  //   - 单帧严重偏离：±20%（至少 1.50ms），1 帧立即停（抓住 12~19ms 的 VRR 跳变）；
-  //   - 跨帧均长（dRef >= 2）：±1%（至少 0.08ms），健康桌面误差通常 <0.02ms，
-  //     VRR 视频下常见 0.07~0.17ms 抖动会被挡住，防止暂停期间误恢复。
-  const uint64_t minSingle = std::max<uint64_t>(1, qpcFreq_ / 2000ULL);   // 0.50 ms
-  const uint64_t minSevere = std::max<uint64_t>(1, qpcFreq_ * 3ULL / 2000ULL);  // 1.50 ms
-  const uint64_t minMulti = std::max<uint64_t>(1, qpcFreq_ / 12500ULL);   // 0.08 ms
-  tolSingleTicks_ = std::max(baselineTicks_ * 8ULL / 100ULL, minSingle);
-  tolSevereTicks_ = std::max(baselineTicks_ * 20ULL / 100ULL, minSevere);
-  tolMultiTicks_ = std::max(baselineTicks_ / 100ULL, minMulti);
+  // 单侧偏慢检测 + 按 dRef 摊薄端点抖动：
+  //   - VRR/DRR 只会拉长帧周期，不会让显示器快于标称刷新率；短于 T_base 的单帧毛刺
+  //     通常是 completedTime/refreshCount 相位错位或前一帧延迟后的补偿，不计入异常。
+  //   - Active 态容忍偶发 1 帧抖动与小幅桌面波动：
+  //       * vblank 轻微偏慢：+12%（至少 0.60ms），严重偏慢：+25%（至少 1.50ms）；
+  //       * 周期均长容差：rate(+3%, >=0.15ms) + jitter(+10%, >=0.50ms)/dRef。
+  //   - Paused 恢复态仍保持较严的跨帧均长门槛，避免在 VRR 视频播放中途误恢复。
+  const uint64_t minVblankMild = std::max<uint64_t>(1, qpcFreq_ * 6ULL / 10000ULL);     // 0.60 ms
+  const uint64_t minSevere = std::max<uint64_t>(1, qpcFreq_ * 15ULL / 10000ULL);        // 1.50 ms
+  const uint64_t minActiveRate = std::max<uint64_t>(1, qpcFreq_ * 15ULL / 100000ULL);   // 0.15 ms
+  const uint64_t minActiveJitter = std::max<uint64_t>(1, qpcFreq_ * 5ULL / 10000ULL);   // 0.50 ms
+  const uint64_t minResumeSingle = std::max<uint64_t>(1, qpcFreq_ * 35ULL / 100000ULL); // 0.35 ms
+  const uint64_t minResumeMulti = std::max<uint64_t>(1, qpcFreq_ * 8ULL / 100000ULL);   // 0.08 ms
+  const uint64_t minResumeJitter = std::max<uint64_t>(1, qpcFreq_ * 16ULL / 100000ULL); // 0.16 ms
+
+  tolVblankMildTicks_ = std::max(baselineTicks_ * 12ULL / 100ULL, minVblankMild);
+  tolSevereTicks_ = std::max(baselineTicks_ * 25ULL / 100ULL, minSevere);
+  tolActiveRateTicks_ = std::max(baselineTicks_ * 3ULL / 100ULL, minActiveRate);
+  tolActiveJitterTicks_ = std::max(baselineTicks_ * 10ULL / 100ULL, minActiveJitter);
+  tolResumeSingleTicks_ = std::max(baselineTicks_ * 6ULL / 100ULL, minResumeSingle);
+  tolResumeMultiTicks_ = std::max(baselineTicks_ / 100ULL, minResumeMulti);
+  tolResumeJitterTicks_ = std::max(baselineTicks_ * 2ULL / 100ULL, minResumeJitter);
 
   const double baseMs = baselineMs();
   const double baseHz = (baseMs > 0.0) ? (1000.0 / baseMs) : 0.0;
@@ -303,11 +230,10 @@ bool FrameGuard::Initialize(uint64_t qpcFreq) {
       (nominalTicks > 0) ? (static_cast<double>(qpcFreq_) / static_cast<double>(nominalTicks))
                          : 0.0;
   DiagLog(L"[guard] baseline=%.3f ms (%.2f Hz, nominal=%.2f Hz, target=src%u/tgt%u, "
-          L"tol=%.2f/%.2f/%.2f ms, dcompStats=%ls)",
+          L"tol=vblank%.2f/severe%.2f/rate%.2f+%.2f ms)",
           baseMs, baseHz, nomHz, primaryTarget_.vidPnSourceId, primaryTarget_.vidPnTargetId,
-          TicksToMs(tolSingleTicks_, qpcFreq_), TicksToMs(tolSevereTicks_, qpcFreq_),
-          TicksToMs(tolMultiTicks_, qpcFreq_),
-          hasDcompStats_ ? L"on" : L"off(win10-fallback)");
+          TicksToMs(tolVblankMildTicks_, qpcFreq_), TicksToMs(tolSevereTicks_, qpcFreq_),
+          TicksToMs(tolActiveRateTicks_, qpcFreq_), TicksToMs(tolActiveJitterTicks_, qpcFreq_));
   return true;
 }
 
@@ -316,8 +242,10 @@ void FrameGuard::ResetSession() {
   hasPrevFrame_ = false;
   commitHead_ = 0;
   commitCount_ = 0;
-  badScore_ = 0;
-  activeCleanStreak_ = 0;
+  timingBadScore_ = 0;
+  timingCleanStreak_ = 0;
+  dropBadScore_ = 0;
+  dropCleanStreak_ = 0;
   goodSamples_ = 0;
   goodRefreshes_ = 0;
   pausedAtTime_ = 0;
@@ -378,8 +306,10 @@ void FrameGuard::EnterPaused(const wchar_t* reason, uint64_t eventTime, double m
 
   paused_ = true;
   pausedAtTime_ = eventTime;
-  badScore_ = 0;
-  activeCleanStreak_ = 0;
+  timingBadScore_ = 0;
+  timingCleanStreak_ = 0;
+  dropBadScore_ = 0;
+  dropCleanStreak_ = 0;
   goodSamples_ = 0;
   goodRefreshes_ = 0;
   commitHead_ = 0;
@@ -394,8 +324,10 @@ void FrameGuard::EnterPaused(const wchar_t* reason, uint64_t eventTime, double m
 void FrameGuard::EnterActive(uint64_t eventTime, double measMs, double vblankMs) {
   paused_ = false;
   lastResumedTime_ = eventTime;
-  badScore_ = 0;
-  activeCleanStreak_ = 0;
+  timingBadScore_ = 0;
+  timingCleanStreak_ = 0;
+  dropBadScore_ = 0;
+  dropCleanStreak_ = 0;
   DiagLog(L"[guard] resumed (samples=%d, refreshes=%llu, meas=%.3f ms, vblank=%.3f ms, base=%.3f ms)",
           goodSamples_, static_cast<unsigned long long>(goodRefreshes_), measMs, vblankMs,
           baselineMs());
@@ -421,55 +353,92 @@ bool FrameGuard::OnFrameSample(const CompletedFrame& curr) {
 
   const uint64_t dt = curr.completedTime - prevFrame_.completedTime;
   const uint64_t measTicks = (dt + static_cast<uint64_t>(dRef) / 2ULL) / static_cast<uint64_t>(dRef);
-  const uint64_t periodErr = AbsDiff(measTicks, baselineTicks_);
+  const uint64_t periodOver = (measTicks > baselineTicks_) ? (measTicks - baselineTicks_) : 0;
+  const uint64_t periodUnder = (baselineTicks_ > measTicks) ? (baselineTicks_ - measTicks) : 0;
+  const uint64_t vblankOver =
+      (curr.vblankDuration > baselineTicks_) ? (curr.vblankDuration - baselineTicks_) : 0;
   const double measMs = TicksToMs(measTicks, qpcFreq_);
   const double vblankMs = TicksToMs(curr.vblankDuration, qpcFreq_);
-  lastMeasuredMs_ = measMs;
 
-  const uint64_t periodTol = (dRef >= 2) ? tolMultiTicks_ : tolSingleTicks_;
-  const bool vblankBad =
-      (curr.vblankDuration > 0 && AbsDiff(curr.vblankDuration, baselineTicks_) > tolSingleTicks_);
-  const bool periodBad = (periodErr > periodTol);
-  const bool severeBad = vblankBad || (periodErr > tolSevereTicks_);
   const bool commitDrop =
       (!paused_ && dRef >= 2 && HasPendingCommitDropped(prevFrame_.startTime, curr.startTime));
 
   prevFrame_ = curr;
   PurgeCommitsBefore(curr.startTime);
 
-  const bool isBad = vblankBad || periodBad || commitDrop;
+  // 物理上显示器无法在 VRR/掉帧时跑得远快于标称刷新率；此类超短样本（如 120Hz 下测出 4.3ms）
+  // 是 completedTime 与 refreshCount 错位 1 帧导致的测量毛刺：既不判异常，也不计入正常恢复样本。
+  const bool fastGlitch = (periodUnder > tolVblankMildTicks_) && (vblankOver <= tolVblankMildTicks_);
+  if (fastGlitch) return false;
+
+  lastMeasuredMs_ = measMs;
 
   if (!paused_) {
-    if (severeBad) {
-      const wchar_t* reason = vblankBad ? L"vblank" : L"period-severe";
-      EnterPaused(reason, curr.completedTime, measMs, vblankMs, dRef);
-      return true;
-    }
-    if (isBad) {
-      activeCleanStreak_ = 0;
-      if (badScore_ < kPauseMildThreshold) ++badScore_;
-      if (badScore_ >= kPauseMildThreshold) {
-        const wchar_t* reason = periodBad ? L"period" : L"drop";
+    const uint64_t activePeriodTol = tolActiveRateTicks_ + tolActiveJitterTicks_ / dRef;
+    const bool vblankMild = (vblankOver > tolVblankMildTicks_);
+    const bool periodMild = (periodOver > activePeriodTol);
+    const bool timingSevere = (vblankOver > tolSevereTicks_) || (periodOver > tolSevereTicks_);
+    const bool timingMild = vblankMild || periodMild;
+
+    if (timingSevere || timingMild) {
+      timingCleanStreak_ = 0;
+      const int weight = timingSevere ? 2 : 1;
+      timingBadScore_ = std::min(timingBadScore_ + weight, kTimingPauseThreshold);
+      if (timingBadScore_ >= kTimingPauseThreshold) {
+        const wchar_t* reason = vblankMild ? L"vblank" : L"period";
         EnterPaused(reason, curr.completedTime, measMs, vblankMs, dRef);
         return true;
       }
-    } else if (badScore_ > 0) {
-      ++activeCleanStreak_;
-      if (activeCleanStreak_ >= kBadDecayStreak) {
-        --badScore_;
-        activeCleanStreak_ = 0;
+    } else if (timingBadScore_ > 0) {
+      if (dRef >= kCleanIdleResetRefs) {
+        timingBadScore_ = 0;
+        timingCleanStreak_ = 0;
+      } else {
+        ++timingCleanStreak_;
+        if (timingCleanStreak_ >= kTimingDecayStreak) {
+          --timingBadScore_;
+          timingCleanStreak_ = 0;
+        }
+      }
+    }
+
+    if (commitDrop) {
+      dropCleanStreak_ = 0;
+      const int weight = (dRef >= 3) ? 2 : 1;
+      dropBadScore_ = std::min(dropBadScore_ + weight, kDropPauseThreshold);
+      if (dropBadScore_ >= kDropPauseThreshold) {
+        EnterPaused(L"drop", curr.completedTime, measMs, vblankMs, dRef);
+        return true;
+      }
+    } else if (dropBadScore_ > 0) {
+      if (dRef >= kCleanIdleResetRefs) {
+        dropBadScore_ = 0;
+        dropCleanStreak_ = 0;
+      } else {
+        ++dropCleanStreak_;
+        if (dropCleanStreak_ >= kDropDecayStreak) {
+          --dropBadScore_;
+          dropCleanStreak_ = 0;
+        }
       }
     }
   } else {
-    if (isBad) {
-      // 暂停期间仍在持续抖动：刷新冷却起点，防止中途误恢复。
+    const uint64_t resumePeriodTol =
+        (dRef >= 2) ? (tolResumeMultiTicks_ + tolResumeJitterTicks_ / dRef)
+                    : tolResumeSingleTicks_;
+    const bool resumeBad =
+        (vblankOver > tolResumeSingleTicks_) || (periodOver > resumePeriodTol);
+
+    if (resumeBad) {
+      // 暂停期间仍在持续偏慢/抖动：刷新冷却起点，防止中途误恢复。
       pausedAtTime_ = curr.completedTime;
       goodSamples_ = 0;
       goodRefreshes_ = 0;
     } else if (curr.completedTime >= pausedAtTime_ + holdoffTicks_) {
       ++goodSamples_;
       goodRefreshes_ += dRef;
-      if (goodSamples_ >= kResumeGoodSamples) {
+      if (goodSamples_ >= kResumeGoodSamples ||
+          (goodSamples_ >= kResumeMinSamplesForSpan && goodRefreshes_ >= kResumeGoodRefreshes)) {
         EnterActive(curr.completedTime, measMs, vblankMs);
         return true;
       }
@@ -478,10 +447,11 @@ bool FrameGuard::OnFrameSample(const CompletedFrame& curr) {
   return false;
 }
 
-bool FrameGuard::PollDcompStats() {
-  const auto fnGetFrameId = reinterpret_cast<GetFrameIdFn>(fnGetFrameId_);
+bool FrameGuard::Poll() {
+  if (qpcFreq_ == 0 || baselineTicks_ == 0) return false;
+
   COMPOSITION_FRAME_ID latest = 0;
-  if (FAILED(fnGetFrameId(COMPOSITION_FRAME_ID_COMPLETED, &latest)) || latest == 0) {
+  if (FAILED(DCompositionGetFrameId(COMPOSITION_FRAME_ID_COMPLETED, &latest)) || latest == 0) {
     return false;
   }
 
@@ -520,53 +490,4 @@ bool FrameGuard::PollDcompStats() {
   }
   lastFrameId_ = latest;
   return paused_ != wasPaused;
-}
-
-bool FrameGuard::PollDwmFallback() {
-  // Windows 10 降级路径：没有 Win11 历史帧统计，仅监测 DWM 上报的刷新周期是否偏离基准。
-  DWM_TIMING_INFO ti{};
-  ti.cbSize = sizeof(ti);
-  if (FAILED(DwmGetCompositionTimingInfo(nullptr, &ti)) || ti.qpcRefreshPeriod == 0) {
-    return false;
-  }
-  const double vblankMs = TicksToMs(ti.qpcRefreshPeriod, qpcFreq_);
-  lastMeasuredMs_ = vblankMs;
-  const bool isBad = (AbsDiff(ti.qpcRefreshPeriod, baselineTicks_) > tolSingleTicks_);
-
-  const uint64_t now = QpcNow();
-  const bool wasPaused = paused_;
-  if (!paused_) {
-    if (isBad) {
-      activeCleanStreak_ = 0;
-      if (badScore_ < kPauseMildThreshold) ++badScore_;
-      if (badScore_ >= kPauseMildThreshold) {
-        EnterPaused(L"dwm-period", now, vblankMs, vblankMs, 1);
-      }
-    } else if (badScore_ > 0) {
-      ++activeCleanStreak_;
-      if (activeCleanStreak_ >= kBadDecayStreak) {
-        --badScore_;
-        activeCleanStreak_ = 0;
-      }
-    }
-  } else {
-    if (isBad) {
-      pausedAtTime_ = now;
-      goodSamples_ = 0;
-      goodRefreshes_ = 0;
-    } else if (now >= pausedAtTime_ + holdoffTicks_) {
-      ++goodSamples_;
-      goodRefreshes_ += 1;
-      if (goodSamples_ >= kResumeGoodSamples) {
-        EnterActive(now, vblankMs, vblankMs);
-      }
-    }
-  }
-  return paused_ != wasPaused;
-}
-
-bool FrameGuard::Poll() {
-  if (qpcFreq_ == 0 || baselineTicks_ == 0) return false;
-  if (hasDcompStats_) return PollDcompStats();
-  return PollDwmFallback();
 }

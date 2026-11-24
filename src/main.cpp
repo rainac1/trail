@@ -135,14 +135,8 @@ RECT PrimaryMonitorRect() {
 }
 
 UINT WindowDpi(HWND hwnd) {
-  using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
-  static const auto fn = reinterpret_cast<GetDpiForWindowFn>(
-      GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
-  if (fn) {
-    const UINT dpi = fn(hwnd);
-    if (dpi) return dpi;
-  }
-  return 96;
+  const UINT dpi = GetDpiForWindow(hwnd);
+  return dpi ? dpi : 96;
 }
 
 // 创建覆盖主显示器矩形的窗口。**先不显示** —— 等渲染栈把视觉树挂上去之后再 ShowWindow。
@@ -521,14 +515,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/, int /*show*/) {
   // Per-monitor DPI 感知（v2）：GetCursorInfo / 钩子坐标 / 窗口矩形都使用物理像素，
   // 和视觉树 offset 同一坐标空间。
-  HMODULE user32 = GetModuleHandleW(L"user32.dll");
-  auto setDpiAwarenessContext = reinterpret_cast<BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT)>(
-      GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
-  if (setDpiAwarenessContext) {
-    setDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  } else {
-    SetProcessDPIAware();
-  }
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
   // ---- 命令行参数 ----
   int maxSprites = 64;
@@ -606,7 +593,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   DiagLog(L"[main] renderer ready: trail=%.3f ms (auto 1-frame), sprites=%d, input=WH_MOUSE_LL",
           trailMs, maxSprites);
 
-  // 采样点到期 / 看门狗用的高分辨率定时器（Windows 10 1803+）。拿不到就退回毫秒超时。
+  // 采样点到期 / 看门狗用的高分辨率定时器；创建失败时退回毫秒超时。
   g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                    TIMER_ALL_ACCESS);
   if (!g_timer) {
@@ -628,6 +615,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
     return cleanupExit(1);
   }
+
+  // 跳过建窗与显示叠加层期间的 DWM 过渡帧，从主循环进入后开始统计。
+  g_frameGuard.ResetSession();
 
   const uint64_t loopStart = QpcNow();
   g_statWindowStart = loopStart;

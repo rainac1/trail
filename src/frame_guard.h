@@ -3,17 +3,16 @@
 
 #include <cstdint>
 
-// DWM 帧时间基准检测与稳定性守卫（单线程、纯被动、零阻塞）。
+// DWM 帧时间基准检测与稳定性守卫（Windows 11+，单线程、纯被动、零阻塞）。
 //
 // 职责：
 //   1. 启动时测定主显示器的基准单帧周期 T_base（结合 QueryDisplayConfig 标称刷新率与
-//      DCompositionGetTargetStatistics / DwmGetCompositionTimingInfo 晶振实测周期），
-//      用作自适应的一帧尾迹寿命。
-//   2. 运行期在主循环已唤醒时顺手消费 DWM 已完成帧的历史环形缓冲（Win11
-//      DCompositionGetFrameId / DCompositionGetStatistics / DCompositionGetTargetStatistics，
-//      动态加载，Win10 退回 DwmGetCompositionTimingInfo）：
+//      DCompositionGetTargetStatistics 晶振实测周期），用作自适应的一帧尾迹寿命。
+//   2. 运行期在主循环已唤醒时顺手消费 DWM 已完成帧的历史环形缓冲（DirectComposition
+//      帧统计 API：DCompositionGetFrameId / DCompositionGetStatistics /
+//      DCompositionGetTargetStatistics）：
 //        - Active 状态：连续偏离 T_base（VRR 抖动/锁低频、DRR 切频、活跃 Commit 期间 DWM
-//          掉帧）时切入 Paused，调用方立即 HideAll 并停止一切 Commit。
+//          持续掉帧）时切入 Paused，调用方立即 HideAll 并停止一切 Commit。
 //        - Paused 状态：完全不 Commit，仅被动观察 DWM 新帧；无新帧则保持 Paused，看到连续
 //          贴合 T_base 的正常帧后自动恢复 Active。
 class FrameGuard {
@@ -32,7 +31,6 @@ class FrameGuard {
   uint64_t baselineTicks() const { return baselineTicks_; }
   double baselineMs() const;
   bool paused() const { return paused_; }
-  bool usingDcompStats() const { return hasDcompStats_; }
 
   // 最近一次观测到的单刷新周期（毫秒，0 表示尚未观测到有效间隔；仅诊断日志用）。
   double lastMeasuredMs() const { return lastMeasuredMs_; }
@@ -55,30 +53,25 @@ class FrameGuard {
     uint32_t refreshCount = 0;
   };
 
-  void LoadDcompStatsApi();
   uint64_t QueryPrimaryDisplayConfig(PrimaryTarget& outTarget) const;
   uint64_t ProbeInitialPeriodTicks(uint64_t nominalTicks);
   bool ReadCompletedFrame(uint64_t frameId, CompletedFrame& out) const;
   bool HasPendingCommitDropped(uint64_t prevStart, uint64_t currStart);
   void PurgeCommitsBefore(uint64_t cutoffQpc);
-  bool PollDcompStats();
-  bool PollDwmFallback();
   bool OnFrameSample(const CompletedFrame& curr);
   void EnterPaused(const wchar_t* reason, uint64_t eventTime, double measMs, double vblankMs,
                    uint32_t dRef);
   void EnterActive(uint64_t eventTime, double measMs, double vblankMs);
 
-  // 动态加载的 Win11 DirectComposition 统计 API（避免 Win10 启动缺导出符号）。
-  void* fnGetFrameId_ = nullptr;
-  void* fnGetStatistics_ = nullptr;
-  void* fnGetTargetStatistics_ = nullptr;
-  bool hasDcompStats_ = false;
-
   uint64_t qpcFreq_ = 0;
   uint64_t baselineTicks_ = 0;
-  uint64_t tolSingleTicks_ = 0;  // 单帧轻微偏离容差：max(8% * T_base, 0.5ms)
-  uint64_t tolSevereTicks_ = 0;  // 单帧严重偏离阈值（1 帧即停）：max(20% * T_base, 1.5ms)
-  uint64_t tolMultiTicks_ = 0;   // 跨帧均长容差（dRef >= 2）：max(1% * T_base, 0.08ms)
+  uint64_t tolVblankMildTicks_ = 0;   // vblank 轻微偏慢容差：max(12% * T_base, 0.60ms)
+  uint64_t tolSevereTicks_ = 0;       // 严重偏慢阈值（+2 分，仍需多帧确认）：max(25% * T_base, 1.50ms)
+  uint64_t tolActiveRateTicks_ = 0;   // Active 跨帧持续偏慢容差：max(3% * T_base, 0.15ms)
+  uint64_t tolActiveJitterTicks_ = 0; // Active 端点抖动摊薄项（除以 dRef）：max(10% * T_base, 0.50ms)
+  uint64_t tolResumeSingleTicks_ = 0; // Paused 恢复单帧偏慢容差：max(6% * T_base, 0.35ms)
+  uint64_t tolResumeMultiTicks_ = 0;  // Paused 恢复跨帧均长容差：max(1% * T_base, 0.08ms)
+  uint64_t tolResumeJitterTicks_ = 0; // Paused 恢复跨帧端点抖动摊薄项：max(2% * T_base, 0.16ms)
 
   PrimaryTarget primaryTarget_{};
 
@@ -92,10 +85,12 @@ class FrameGuard {
   uint32_t commitHead_ = 0;
   uint32_t commitCount_ = 0;
 
-  // 双态机状态（非对称迟滞：快停、稳恢复 + 快速复发指数退避）
+  // 双态机状态（需多帧持续偏离才暂停，区分时序/VRR 与 DWM 掉帧，带指数退避恢复）
   bool paused_ = false;
-  int badScore_ = 0;
-  int activeCleanStreak_ = 0;
+  int timingBadScore_ = 0;
+  int timingCleanStreak_ = 0;
+  int dropBadScore_ = 0;
+  int dropCleanStreak_ = 0;
   int goodSamples_ = 0;
   uint64_t goodRefreshes_ = 0;
   uint64_t pausedAtTime_ = 0;

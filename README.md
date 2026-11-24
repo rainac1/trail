@@ -12,7 +12,7 @@ Windows 全屏透明叠加层：在光标身后显示一串残影。鼠标每回
 
 ## 构建
 
-前置：Windows 10+、Visual Studio 2017+（“使用 C++ 的桌面开发”工作负载）、CMake 3.16+。
+前置：Windows 11（21H2 及以上）、Visual Studio 2022+（“使用 C++ 的桌面开发”工作负载，含 Windows 11 SDK 10.0.22000+）、CMake 3.16+。
 
 ```bat
 build.bat            REM Release
