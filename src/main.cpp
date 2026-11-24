@@ -1,12 +1,15 @@
-// 事件驱动的鼠标尾迹全屏透明叠加层（WH_MOUSE_LL + DirectComposition 视觉树）
+// 事件驱动的鼠标尾迹透明叠加层（Windows 11+，WH_MOUSE_LL + DirectComposition 视觉树）
 //
 // 单线程：一个窗口 + 消息循环 + 一个全局低级鼠标钩子。没有渲染 tick、没有轮询采样：
 // WH_MOUSE_LL 回调只把 (x, y, qpc) 写入定长环形缓冲并立刻放行，不在钩子内做任何
 // GDI / DComp / Commit 调用；紧随 PeekMessageW 之后主循环立即批量更新视觉树并做一次
 // Commit。DWM 在它自己的合成时刻读取视觉树 —— 我们不做"赶"，也就没有"错过"。
 //
-// 窗口只覆盖**主显示器**：其它显示器不画。按显示器拆窗口曾让 DWM 的合成路径变复杂
-// （实测放视频时会把整个桌面拖慢），不如干脆只服务主屏。
+// 多屏 / 多 DPI / 动态拓扑：全系统始终只维护**一个**叠加层窗口，跟随光标移动到当前所在的
+// 显示器（绝不按显示器建多个全屏叠加窗口，避免非活动显示器上的视频失去硬件平面/MPO）。
+// 每个显示器拥有独立的 FrameGuard（独立基准刷新周期与 VRR/掉帧守卫）：当当前屏触发 VRR
+// 或持续掉帧而暂停时，不仅清空尾迹还会隐藏叠加层窗口，让该屏视频保持原生呈现路径；分辨率、
+// 刷新率、DPI 或插拔屏变化时自动防抖重建拓扑，无需重启。
 //
 // 尾迹不在像素里：每个采样点是一个 visual，全部共享同一张光标贴图 surface；运行期只改
 // offset / visible，没有绘制、没有整屏拷贝。"一个采样点显示一帧然后消失"变成"把它设成
@@ -16,8 +19,8 @@
 // 高分辨率可等待定时器：它被 arm 到"最早一个可见采样点的到期时刻"。这是事件驱动的
 // 超时，不是 tick —— 仅在 deadline 变化或触发后才重新编程定时器。
 //
-// 500ms 一次的健康检查只负责看门狗职责：置顶样式、设备有效性，以及在没有鼠标事件时
-// 对账光标可见性/位置（ShowCursor / SetCursorPos 不会触发鼠标钩子）。
+// 500ms 一次的健康检查只负责看门狗职责：置顶样式、设备有效性、拓扑/DPI 对账，以及在没有
+// 鼠标事件时对账光标可见性/位置（ShowCursor / SetCursorPos 不会触发鼠标钩子）。
 #include <windows.h>
 
 #include <algorithm>
@@ -39,6 +42,7 @@ constexpr UINT kQuitHotkeyId = 1;
 constexpr UINT kHealthCheckMs = 500;
 constexpr UINT kStatsIntervalMs = 2000;
 constexpr UINT kCursorRetryMs = 100;
+constexpr UINT kTopologyDebounceMs = 150;
 constexpr UINT kRecreateInitialBackoffMs = 500;
 constexpr UINT kRecreateMaxBackoffMs = 15000;
 constexpr uint32_t kPendingCapacity = 128;
@@ -52,7 +56,7 @@ enum class CreateOverlayStatus {
 };
 
 OverlayRenderer g_renderer;
-FrameGuard g_frameGuard;
+DisplayGuardManager g_displayGuard;
 HCURSOR g_cursorHandle = nullptr;  // 已上传到渲染器的光标句柄（nullptr = 需要重抓）
 uint64_t g_nextCursorRetryTicks = 0;
 bool g_cursorCaptureFailureLogged = false;
@@ -67,9 +71,17 @@ int g_lastCursorY = INT_MIN;
 bool g_haveLastCursor = false;
 bool g_cursorVisible = false;  // 上一次观察到的系统光标可见性
 
+// ---- 叠加层窗口与当前活动显示器状态 ----
 HWND g_hwnd = nullptr;
-RECT g_windowRect{};  // 主显示器矩形（虚拟屏幕坐标里的物理像素）
-UINT g_windowDpi = 96;
+RECT g_windowRect{};           // 当前活动显示器矩形（虚拟屏幕坐标里的物理像素）
+UINT g_windowDpi = 96;         // 当前活动显示器 DPI
+int g_activeMonitor = -1;      // g_displayGuard 中的当前活动显示器下标
+bool g_windowVisible = false;  // 叠加层窗口是否处于可见状态
+bool g_movingWindow = false;   // 主动 SetWindowPos 期间置位，忽略随之产生的 WM_DPICHANGED
+
+// ---- 动态拓扑/DPI 变更防抖状态 ----
+bool g_topologyDirty = false;
+uint64_t g_topologyRebuildAt = 0;
 
 HHOOK g_mouseHook = nullptr;
 bool g_mouseHookReady = false;  // 钩子已安装且允许写入待处理采样缓冲
@@ -123,23 +135,27 @@ void PrintUsage() {
       L"Quit: Ctrl+Alt+Q\n");
 }
 
-// 主显示器的物理像素矩形（per-monitor DPI 感知下即真实像素）。
-RECT PrimaryMonitorRect() {
-  const POINT origin{0, 0};
-  const HMONITOR monitor = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
-  MONITORINFO info{};
-  info.cbSize = sizeof(info);
-  if (GetMonitorInfoW(monitor, &info)) return info.rcMonitor;
-  const RECT fallback{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-  return fallback;
+const DisplayGuardManager::MonitorSlot* ActiveMonitorSlot() {
+  if (g_activeMonitor < 0 || g_activeMonitor >= g_displayGuard.monitorCount()) return nullptr;
+  return &g_displayGuard.monitor(g_activeMonitor);
 }
 
-UINT WindowDpi(HWND hwnd) {
-  const UINT dpi = GetDpiForWindow(hwnd);
-  return dpi ? dpi : 96;
+bool ActiveMonitorPaused() {
+  const auto* slot = ActiveMonitorSlot();
+  return !slot || slot->guard.paused();
 }
 
-// 创建覆盖主显示器矩形的窗口。**先不显示** —— 等渲染栈把视觉树挂上去之后再 ShowWindow。
+int PickInitialMonitor() {
+  if (g_displayGuard.monitorCount() == 0) return -1;
+  POINT pt{};
+  if (GetCursorPos(&pt)) {
+    const int idx = g_displayGuard.FindMonitorOrNearest(pt.x, pt.y);
+    if (idx >= 0) return idx;
+  }
+  return g_displayGuard.primaryMonitorIndex();
+}
+
+// 创建覆盖指定显示器矩形的窗口。**先不显示** —— 等渲染栈把视觉树挂上去之后再 ShowWindow。
 HWND CreateOverlayWindow(const RECT& rect) {
   const int width = rect.right - rect.left;
   const int height = rect.bottom - rect.top;
@@ -158,8 +174,51 @@ HWND CreateOverlayWindow(const RECT& rect) {
   return hwnd;
 }
 
-// 用现有窗口重建渲染栈（设备丢失恢复）。窗口/几何/DPI 都不变。
-bool InitRenderer(int maxSprites, double trailMs) {
+// 移动/缩放并显示叠加层窗口到目标显示器的物理像素矩形（带 g_movingWindow 守卫忽略跨屏 WM_DPICHANGED）。
+void MoveAndShowOverlayWindow(const RECT& rect, UINT dpi) {
+  if (!g_hwnd) return;
+  const int width = rect.right - rect.left;
+  const int height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+
+  g_movingWindow = true;
+  SetWindowPos(g_hwnd, HWND_TOPMOST, rect.left, rect.top, width, height,
+               SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOREDRAW);
+  g_movingWindow = false;
+
+  g_windowRect = rect;
+  g_windowDpi = dpi ? dpi : 96;
+  g_windowVisible = true;
+}
+
+// 光标不可见（或切屏/暂停前清空尾迹）：叠加层不该留下任何残影。
+void HideCursorVisuals() {
+  if (g_cursorVisible || g_renderer.liveSprites() > 0) g_renderer.HideAll();
+  g_cursorVisible = false;
+  g_haveLastCursor = false;
+  g_lastCursorX = INT_MIN;
+  g_lastCursorY = INT_MIN;
+}
+
+// 同步窗口可见性：当前屏被 FrameGuard 暂停时隐藏 HWND（释放该屏 MPO/DirectFlip），恢复绘制时再显示。
+void SyncOverlayVisibility(bool shouldShow) {
+  if (!g_hwnd) return;
+  if (shouldShow) {
+    if (!g_windowVisible) {
+      const auto* slot = ActiveMonitorSlot();
+      if (slot) MoveAndShowOverlayWindow(slot->desc.rect, slot->desc.dpi);
+    }
+  } else {
+    HideCursorVisuals();
+    if (g_windowVisible) {
+      ShowWindow(g_hwnd, SW_HIDE);
+      g_windowVisible = false;
+    }
+  }
+}
+
+// 用现有窗口重建渲染栈（启动初始化或设备丢失恢复）。
+bool InitRenderer(int maxSprites, const RECT& rect, UINT dpi, double trailMs) {
   g_renderer.Shutdown();
 
   // 新的视觉树没有任何内容，旧的贴图/采样点位置全部作废。
@@ -171,7 +230,7 @@ bool InitRenderer(int maxSprites, double trailMs) {
   g_lastCursorX = INT_MIN;
   g_lastCursorY = INT_MIN;
 
-  if (!g_renderer.Initialize(g_hwnd, g_windowRect, g_windowDpi, maxSprites, g_qpcFreq)) {
+  if (!g_renderer.Initialize(g_hwnd, rect, dpi, maxSprites, g_qpcFreq)) {
     return false;
   }
   g_renderer.SetTrailLifetimeMs(trailMs);
@@ -179,8 +238,16 @@ bool InitRenderer(int maxSprites, double trailMs) {
 }
 
 // 启动路径：建窗口 -> 抢占退出热键 -> 建渲染栈 -> 最后才让窗口可见。
-CreateOverlayStatus CreateOverlay(int maxSprites, double trailMs) {
-  g_windowRect = PrimaryMonitorRect();
+CreateOverlayStatus CreateOverlay(int maxSprites) {
+  g_activeMonitor = PickInitialMonitor();
+  const auto* slot = ActiveMonitorSlot();
+  if (!slot) {
+    DiagLog(L"[main] no active monitor found");
+    return CreateOverlayStatus::Failed;
+  }
+
+  g_windowRect = slot->desc.rect;
+  g_windowDpi = slot->desc.dpi;
   g_hwnd = CreateOverlayWindow(g_windowRect);
   if (!g_hwnd) {
     DiagLog(L"[main] CreateWindowExW failed (error=%lu)", GetLastError());
@@ -197,8 +264,7 @@ CreateOverlayStatus CreateOverlay(int maxSprites, double trailMs) {
     return CreateOverlayStatus::HotkeyBusy;
   }
 
-  g_windowDpi = WindowDpi(g_hwnd);
-  if (!InitRenderer(maxSprites, trailMs)) {
+  if (!InitRenderer(maxSprites, g_windowRect, g_windowDpi, slot->guard.baselineMs())) {
     UnregisterHotKey(g_hwnd, kQuitHotkeyId);
     g_tearingDownWindow = true;
     DestroyWindow(g_hwnd);
@@ -207,45 +273,99 @@ CreateOverlayStatus CreateOverlay(int maxSprites, double trailMs) {
     return CreateOverlayStatus::Failed;
   }
 
-  ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-  SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
-  DiagLog(L"[main] window %d,%d %dx%d dpi=%u hwnd=%p", static_cast<int>(g_windowRect.left),
-          static_cast<int>(g_windowRect.top),
+  MoveAndShowOverlayWindow(g_windowRect, g_windowDpi);
+  DiagLog(L"[main] window mon#%d %d,%d %dx%d dpi=%u hwnd=%p", g_activeMonitor,
+          static_cast<int>(g_windowRect.left), static_cast<int>(g_windowRect.top),
           static_cast<int>(g_windowRect.right - g_windowRect.left),
           static_cast<int>(g_windowRect.bottom - g_windowRect.top), g_windowDpi,
           static_cast<void*>(g_hwnd));
   return CreateOverlayStatus::Ok;
 }
 
-// 顶层样式是叠加层可见的前提：窗口被压到其他窗口之下就等于渲染消失。仅在样式确实
+// 顶层样式是叠加层可见的前提：窗口被压到其他窗口之下就等于渲染消失。仅在窗口可见且样式确实
 // 丢失时才重新置顶，避免周期性抢 z-order。
 void EnsureTopmost(HWND hwnd) {
+  if (!hwnd || !g_windowVisible) return;
   if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) return;
   DiagLog(L"[watch] WS_EX_TOPMOST lost -> re-asserting");
+  g_movingWindow = true;
   SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
+  g_movingWindow = false;
 }
 
 void RecordCommit(uint64_t now) {
   ++g_statCommits;
-  g_frameGuard.NotifyCommit(now);
+  g_displayGuard.NotifyCommit(g_activeMonitor, now);
   if (!DiagLogEnabled()) return;
   const double us = TicksToUs(g_renderer.lastCommitTicks());
   g_statCommitUsSum += us;
   if (us > g_statCommitUsMax) g_statCommitUsMax = us;
 }
 
-// 光标不可见（或被应用隐藏）：叠加层不该留下任何尾迹。
-void HideCursorVisuals() {
-  if (g_cursorVisible || g_renderer.liveSprites() > 0) g_renderer.HideAll();
-  g_cursorVisible = false;
-  g_haveLastCursor = false;
-  g_lastCursorX = INT_MIN;
-  g_lastCursorY = INT_MIN;
+// 切换叠加层到目标显示器（同步几何、DPI 光标 Surface 与该屏一帧尾迹寿命）。
+void SwitchActiveMonitor(int monIdx, bool forceGeometrySync) {
+  if (monIdx < 0 || monIdx >= g_displayGuard.monitorCount()) return;
+  if (!forceGeometrySync && monIdx == g_activeMonitor) return;
+
+  HideCursorVisuals();
+  g_activeMonitor = monIdx;
+
+  const auto& slot = g_displayGuard.monitor(monIdx);
+  g_windowRect = slot.desc.rect;
+  g_windowDpi = slot.desc.dpi;
+
+  if (g_renderer.ready()) {
+    bool needCursorReupload = false;
+    const OverlayRenderer::FrameResult fr = g_renderer.SetMonitorGeometry(
+        slot.desc.rect, slot.desc.dpi, slot.guard.baselineMs(), &needCursorReupload);
+    if (fr == OverlayRenderer::FrameResult::RecreateDevice) {
+      g_deviceLost = true;
+      return;
+    }
+    if (needCursorReupload) {
+      g_cursorHandle = nullptr;
+      g_nextCursorRetryTicks = 0;
+      g_cursorCaptureFailureLogged = false;
+    }
+  }
+
+  if (slot.guard.paused()) {
+    SyncOverlayVisibility(false);
+  } else {
+    MoveAndShowOverlayWindow(slot.desc.rect, slot.desc.dpi);
+  }
 }
 
-// 光标贴图：仅在句柄变化时重新抓取并上传（形状变化罕见）。失败时 100ms 后再试。
+void RequestTopologyRebuild(const wchar_t* reason) {
+  const bool first = !g_topologyDirty;
+  g_topologyDirty = true;
+  g_topologyRebuildAt = QpcNow() + MsToTicks(kTopologyDebounceMs);
+  if (first) {
+    DiagLog(L"[watch] display topology/DPI change (%ls) -> scheduling refresh", reason);
+  }
+}
+
+void ApplyTopologyChange() {
+  g_topologyDirty = false;
+  g_topologyRebuildAt = 0;
+
+  HideCursorVisuals();
+  g_displayGuard.RefreshTopology();
+  if (g_displayGuard.monitorCount() == 0) {
+    g_activeMonitor = -1;
+    SyncOverlayVisibility(false);
+    DiagLog(L"[watch] no active monitors available; overlay hidden");
+    return;
+  }
+
+  const int target = PickInitialMonitor();
+  SwitchActiveMonitor(target, /*forceGeometrySync=*/true);
+  // 跳过显示模式切换与窗口重定位导致的 DWM 过渡帧。
+  g_displayGuard.ResetSession();
+}
+
+// 光标贴图：仅在句柄变化（或跨 DPI 重建 Surface 后）重新抓取并上传。失败时 100ms 后再试。
 void EnsureCursorBitmap(HCURSOR hCursor, uint64_t now) {
   if (hCursor == g_cursorHandle || now < g_nextCursorRetryTicks) return;
 
@@ -282,7 +402,25 @@ void FlushPendingSamples(uint64_t now) {
     --g_pendingCount;
   }
 
-  if (!g_renderer.ready() || g_deviceLost || g_frameGuard.paused()) return;
+  if (!g_renderer.ready() || g_deviceLost || g_topologyDirty ||
+      g_displayGuard.monitorCount() == 0) {
+    return;
+  }
+
+  // 按最新采样点定位当前屏幕：跨屏时先切换叠加层窗口与 DPI/帧周期配置。
+  const Sample& latest = batch[rawCount - 1];
+  const int targetMon = g_displayGuard.FindMonitorOrNearest(latest.x, latest.y);
+  if (targetMon < 0) return;
+  if (targetMon != g_activeMonitor) {
+    SwitchActiveMonitor(targetMon, /*forceGeometrySync=*/false);
+    if (g_deviceLost) return;
+  }
+
+  if (ActiveMonitorPaused()) {
+    SyncOverlayVisibility(false);
+    return;
+  }
+  SyncOverlayVisibility(true);
 
   CURSORINFO ci{};
   ci.cbSize = sizeof(ci);
@@ -347,25 +485,40 @@ bool InstallMouseHook() {
 // 没有鼠标事件时对账光标状态：应用调用 ShowCursor / SetCursorPos 不会产生鼠标钩子。
 // 第一次对账（启动后还没有任何鼠标事件）只建立位置基准，不凭空产生采样点。
 void ReconcileCursor(uint64_t now) {
-  if (!g_renderer.ready() || g_deviceLost || g_frameGuard.paused()) return;
+  if (!g_renderer.ready() || g_deviceLost || g_topologyDirty ||
+      g_displayGuard.monitorCount() == 0) {
+    return;
+  }
   CURSORINFO ci{};
   ci.cbSize = sizeof(ci);
   if (!GetCursorInfo(&ci) || (ci.flags & CURSOR_SHOWING) == 0 || !ci.hCursor) {
     HideCursorVisuals();
     return;
   }
+
+  const int x = ci.ptScreenPos.x;
+  const int y = ci.ptScreenPos.y;
+  const int targetMon = g_displayGuard.FindMonitorOrNearest(x, y);
+  if (targetMon >= 0 && targetMon != g_activeMonitor) {
+    SwitchActiveMonitor(targetMon, /*forceGeometrySync=*/false);
+    if (g_deviceLost) return;
+  }
+  if (ActiveMonitorPaused()) {
+    SyncOverlayVisibility(false);
+    return;
+  }
+
   g_cursorVisible = true;
   if (!g_haveLastCursor) {
-    g_lastCursorX = ci.ptScreenPos.x;
-    g_lastCursorY = ci.ptScreenPos.y;
+    g_lastCursorX = x;
+    g_lastCursorY = y;
     g_haveLastCursor = true;
     return;
   }
 
+  SyncOverlayVisibility(true);
   EnsureCursorBitmap(ci.hCursor, now);
-  const int x = ci.ptScreenPos.x;
-  const int y = ci.ptScreenPos.y;
-  if (g_haveLastCursor && x == g_lastCursorX && y == g_lastCursorY) return;
+  if (x == g_lastCursorX && y == g_lastCursorY) return;
 
   g_lastCursorX = x;
   g_lastCursorY = y;
@@ -439,13 +592,17 @@ void LogStats(uint64_t now) {
   const double secs = static_cast<double>(now - g_statWindowStart) / static_cast<double>(g_qpcFreq);
   if (secs <= 0.0) return;
 
+  const auto* slot = ActiveMonitorSlot();
+  const double frameMs = slot ? slot->guard.lastMeasuredMs() : 0.0;
+  const int paused = (!slot || slot->guard.paused()) ? 1 : 0;
+
   const double events = static_cast<double>(g_statEvents);
   const double commits = static_cast<double>(g_statCommits);
-  DiagLog(L"[update] events=%.1f/s samples=%.1f/s commits=%.1f/s live=%d | "
+  DiagLog(L"[update] mon#%d events=%.1f/s samples=%.1f/s commits=%.1f/s live=%d | "
           L"commit mean=%.1f max=%.1f us | frame=%.2f ms paused=%d",
-          events / secs, static_cast<double>(g_statSamples) / secs, commits / secs,
-          g_renderer.liveSprites(), commits > 0.0 ? g_statCommitUsSum / commits : 0.0,
-          g_statCommitUsMax, g_frameGuard.lastMeasuredMs(), g_frameGuard.paused() ? 1 : 0);
+          g_activeMonitor, events / secs, static_cast<double>(g_statSamples) / secs,
+          commits / secs, g_renderer.liveSprites(),
+          commits > 0.0 ? g_statCommitUsSum / commits : 0.0, g_statCommitUsMax, frameMs, paused);
 
   g_statWindowStart = now;
   g_statEvents = 0;
@@ -473,6 +630,7 @@ void ShutdownApp() {
     UnregisterHotKey(g_hwnd, kQuitHotkeyId);
     g_tearingDownWindow = true;
     ShowWindow(g_hwnd, SW_HIDE);
+    g_windowVisible = false;
     g_renderer.Shutdown();
     DestroyWindow(g_hwnd);
     g_hwnd = nullptr;
@@ -491,10 +649,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       if (g_renderer.ready() && !g_renderer.DeviceValid()) g_deviceLost = true;
       return 0;
     case WM_DISPLAYCHANGE:
-      DiagLog(L"[watch] display topology changed (restart trail to adapt)");
+      RequestTopologyRebuild(L"WM_DISPLAYCHANGE");
       return 0;
     case WM_DPICHANGED:
-      DiagLog(L"[watch] display DPI changed (restart trail to adapt)");
+      // 本程序主动跨屏 SetWindowPos 时也会收到 WM_DPICHANGED，忽略之；
+      // 若为系统 DPI 缩放变更则触发拓扑与 Surface 刷新。
+      if (!g_movingWindow) RequestTopologyRebuild(L"WM_DPICHANGED");
+      return 0;
+    case WM_SETTINGCHANGE:
+      if (wParam == SPI_SETLOGICALDPIOVERRIDE ||
+          (lParam != 0 && _wcsicmp(reinterpret_cast<const wchar_t*>(lParam), L"WindowMetrics") == 0)) {
+        RequestTopologyRebuild(L"WM_SETTINGCHANGE");
+      }
       return 0;
     case WM_HOTKEY:
       PostQuitMessage(0);
@@ -563,8 +729,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
   g_instance = hInstance;
 
-  g_frameGuard.Initialize(g_qpcFreq);
-  const double trailMs = g_frameGuard.baselineMs();
+  if (!g_displayGuard.Initialize(g_qpcFreq)) {
+    DiagFatal(L"Trail", L"未检测到可用的活动显示器。");
+    return cleanupExit(1);
+  }
 
   WNDCLASSEXW wc{};
   wc.cbSize = sizeof(wc);
@@ -579,7 +747,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     return cleanupExit(1);
   }
 
-  const CreateOverlayStatus status = CreateOverlay(maxSprites, trailMs);
+  const CreateOverlayStatus status = CreateOverlay(maxSprites);
   if (status == CreateOverlayStatus::HotkeyBusy) {
     DiagFatal(L"Trail", L"退出热键 Ctrl+Alt+Q 已被其他程序占用，程序退出。");
     return cleanupExit(1);
@@ -590,8 +758,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
               L"可加 --log 参数记录具体失败步骤。");
     return cleanupExit(1);
   }
-  DiagLog(L"[main] renderer ready: trail=%.3f ms (auto 1-frame), sprites=%d, input=WH_MOUSE_LL",
-          trailMs, maxSprites);
+  DiagLog(L"[main] renderer ready: monitors=%d, sprites=%d, input=WH_MOUSE_LL",
+          g_displayGuard.monitorCount(), maxSprites);
 
   // 采样点到期 / 看门狗用的高分辨率定时器；创建失败时退回毫秒超时。
   g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -617,7 +785,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
   }
 
   // 跳过建窗与显示叠加层期间的 DWM 过渡帧，从主循环进入后开始统计。
-  g_frameGuard.ResetSession();
+  g_displayGuard.ResetSession();
 
   const uint64_t loopStart = QpcNow();
   g_statWindowStart = loopStart;
@@ -642,16 +810,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
 
     const uint64_t now = QpcNow();
 
-    // ---- 帧时间守卫：被动消费 DWM 已完成帧，偏离启动基准时清空尾迹并停 Commit ----
-    if (g_frameGuard.Poll() && g_frameGuard.paused()) {
-      HideCursorVisuals();
+    // ---- 动态拓扑/DPI 变更（防抖后一次性重建多屏表与窗口几何）----
+    if (g_topologyDirty) {
+      if (g_renderer.liveSprites() > 0) HideCursorVisuals();
+      if (now >= g_topologyRebuildAt) ApplyTopologyChange();
+    }
+
+    // ---- 分屏帧时间守卫：统一轮询 DWM 已完成帧并按屏分发 ----
+    if (!g_topologyDirty && g_displayGuard.Poll()) {
+      if (ActiveMonitorPaused()) SyncOverlayVisibility(false);
     }
 
     // ---- 批量提交本轮钩子采集的采样点 ----
     FlushPendingSamples(now);
 
     // ---- 采样点到期：定时器把我们从等待中叫醒，隐藏已经过期的槽位 ----
-    if (g_renderer.ready() && !g_deviceLost && !g_frameGuard.paused()) {
+    if (g_renderer.ready() && !g_deviceLost && !g_topologyDirty && !ActiveMonitorPaused()) {
       const uint64_t expiry = g_renderer.NextExpiryQpc();
       if (expiry != 0 && now >= expiry) {
         bool committed = false;
@@ -662,12 +836,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     }
 
     // ---- 设备丢失恢复：用现有窗口重建渲染栈 ----
-    if (g_deviceLost) {
+    if (g_deviceLost && !g_topologyDirty) {
       if (nextRecreate == 0 || now >= nextRecreate) {
         DiagLog(L"[recover] rebuilding after device loss");
-        if (InitRenderer(maxSprites, trailMs)) {
+        if (g_displayGuard.monitorCount() == 0 || g_displayGuard.TopologyChanged()) {
+          g_displayGuard.RefreshTopology();
+          g_activeMonitor = PickInitialMonitor();
+        }
+        const auto* slot = ActiveMonitorSlot();
+        if (slot && InitRenderer(maxSprites, slot->desc.rect, slot->desc.dpi,
+                                 slot->guard.baselineMs())) {
           DiagLog(L"[recover] renderer rebuilt");
-          g_frameGuard.ResetSession();
+          g_windowRect = slot->desc.rect;
+          g_windowDpi = slot->desc.dpi;
+          g_displayGuard.ResetSession();
+          MoveAndShowOverlayWindow(g_windowRect, g_windowDpi);
           g_deviceLost = false;
           nextRecreate = 0;
           recreateBackoffMs = kRecreateInitialBackoffMs;
@@ -683,6 +866,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     // ---- 健康检查（看门狗，不是渲染节拍）----
     if (now >= nextHealth) {
       nextHealth = now + MsToTicks(kHealthCheckMs);
+      if (!g_topologyDirty && g_displayGuard.TopologyChanged()) {
+        DiagLog(L"[watch] display topology/DPI change detected -> refreshing");
+        ApplyTopologyChange();
+      }
       EnsureTopmost(g_hwnd);
       if (g_renderer.ready() && !g_renderer.DeviceValid()) g_deviceLost = true;
       ReconcileCursor(now);
@@ -694,10 +881,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
       nextStats = now + MsToTicks(kStatsIntervalMs);
     }
 
-    // ---- 计算下一次唤醒时刻：最早到期 / 健康检查 / 统计 / 重建重试 ----
+    // ---- 计算下一次唤醒时刻：最早到期 / 拓扑防抖 / 健康检查 / 统计 / 重建重试 ----
     uint64_t deadline = nextHealth;
     if (DiagLogEnabled() && nextStats < deadline) deadline = nextStats;
-    if (g_deviceLost) {
+    if (g_topologyDirty && g_topologyRebuildAt < deadline) deadline = g_topologyRebuildAt;
+    if (g_deviceLost && !g_topologyDirty) {
       // nextRecreate == 0 表示刚检测到设备丢失，立即进入下一轮重建而不空等看门狗周期。
       if (nextRecreate == 0) {
         deadline = now;

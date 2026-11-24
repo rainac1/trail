@@ -29,4 +29,4 @@ else()
   target_compile_options(trail PRIVATE $<$<CONFIG:Release>:-O3>)
 endif()
 
-target_link_libraries(trail PRIVATE d3d11 dxgi dcomp)
+target_link_libraries(trail PRIVATE d3d11 dxgi dcomp shcore)

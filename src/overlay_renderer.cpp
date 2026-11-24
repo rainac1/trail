@@ -270,6 +270,49 @@ void OverlayRenderer::SetTrailLifetimeMs(double ms) {
   trailTicks_ = static_cast<uint64_t>(ms * static_cast<double>(qpcFreq_) / 1000.0);
 }
 
+OverlayRenderer::FrameResult OverlayRenderer::SetMonitorGeometry(const RECT& windowRect, UINT dpi,
+                                                                 double trailMs,
+                                                                 bool* needCursorReupload) {
+  if (needCursorReupload) *needCursorReupload = false;
+  if (!initialized_ || !dcompDevice_) return FrameResult::RecreateDevice;
+
+  const bool hadLive = (live_ > 0);
+  if (hadLive) HideVisibleSlots();
+
+  rect_ = windowRect;
+  SetTrailLifetimeMs(trailMs);
+
+  const UINT effectiveDpi = dpi ? dpi : 96;
+  const int newW = CursorMetricForDpi(SM_CXCURSOR, effectiveDpi);
+  const int newH = CursorMetricForDpi(SM_CYCURSOR, effectiveDpi);
+  if (newW <= 0 || newH <= 0) return FrameResult::Failed;
+
+  if (newW != spriteW_ || newH != spriteH_) {
+    Microsoft::WRL::ComPtr<IDCompositionSurface> newSurface;
+    const HRESULT hr = dcompDevice_->CreateSurface(
+        static_cast<UINT>(newW), static_cast<UINT>(newH), DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_ALPHA_MODE_PREMULTIPLIED, &newSurface);
+    if (FAILED(hr)) {
+      LogHr(L"CreateSurface(sprite resize)", hr);
+      return IsDeviceLost(hr) ? FrameResult::RecreateDevice : FrameResult::Failed;
+    }
+
+    spriteSurface_ = std::move(newSurface);
+    for (Slot& slot : slots_) {
+      slot.visual->SetContent(spriteSurface_.Get());
+    }
+    spriteW_ = newW;
+    spriteH_ = newH;
+    hotX_ = 0;
+    hotY_ = 0;
+    hasCursorBitmap_ = false;
+    if (needCursorReupload) *needCursorReupload = true;
+    return CommitNow(nullptr);
+  }
+
+  return hadLive ? CommitNow(nullptr) : FrameResult::Ok;
+}
+
 void OverlayRenderer::LogFailureOnce(const wchar_t* step, HRESULT hr) {
   if (loggedFailure_) return;
   loggedFailure_ = true;

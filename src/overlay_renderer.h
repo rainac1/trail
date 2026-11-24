@@ -12,7 +12,7 @@
 #include "cursor_texture.h"
 #include "mouse_sample.h"
 
-// 一个覆盖主显示器的窗口 + 一棵 DirectComposition 视觉树。
+// 一个覆盖当前活动显示器的窗口 + 一棵 DirectComposition 视觉树。
 //
 // 尾迹不在像素里：每个采样点是一个 visual，全部共享同一张光标贴图 surface；运行期只改
 // offset / visible，没有绘制、没有整屏拷贝。一个采样点"显示一帧然后消失"变成"把它设成
@@ -21,8 +21,8 @@
 // 槽位按 FIFO 环形队列管理：新采样点按单调递增的时间戳写入队尾，满时覆盖队头；可见槽位
 // 始终是连续区间 [head_, head_ + live_) mod N，因此到期查询 O(1)、过期回收 O(expired)。
 //
-// 光标贴图尺寸：窗口 DPI 在渲染器生命周期内固定，surface 只在初始化时创建并绑定一次，
-// 后续光标换形状仅原位更新像素，无需重建 surface 或重绑视觉树。
+// 多屏与多 DPI：始终只维护一个叠加层窗口并跟随光标所在显示器移动；当目标显示器 DPI 对应的
+// 光标像素尺寸变化时，仅原位重建共享 surface 并重绑视觉，无需重建 D3D/DComp 设备。
 //
 // 设备丢失：本窗口没有 GDI 内容，可见像素 100% 来自 DWM 合成的视觉树，设备一旦丢失叠加层
 // 会整体变透明且不会自愈 —— 调用方必须重建整套设备与内容（RecreateDevice / DeviceValid）。
@@ -45,6 +45,11 @@ class OverlayRenderer {
 
   // 尾迹寿命（毫秒）：采样点从可见到隐藏的时间窗。
   void SetTrailLifetimeMs(double ms);
+
+  // 切换叠加层所在显示器的几何、DPI 与尾迹寿命（隐藏旧尾迹；若目标 DPI 导致光标像素尺寸变化，
+  // 仅原位重建共享 surface 并重绑视觉，同时将 *needCursorReupload 置为 true）。
+  FrameResult SetMonitorGeometry(const RECT& windowRect, UINT dpi, double trailMs,
+                                 bool* needCursorReupload);
 
   // 当前可见的采样点视觉数量（诊断用）。
   int liveSprites() const { return live_; }

@@ -2,15 +2,22 @@
 
 English | [中文](README.md)
 
-A full-screen, transparent Windows overlay that leaves a trail of afterimages behind the cursor.
-Every time the mouse reports, one more trail point is added; at startup the program automatically
-measures the primary monitor's single-frame refresh period and uses it as the trail lifetime, so
-each trail point is shown for one frame before disappearing. The trail length depends on how far
-the cursor moved during that time.
+A transparent Windows overlay that leaves a trail of afterimages behind the cursor. Every time the
+mouse reports, one more trail point is added; the program automatically detects each active
+monitor's single-frame refresh period and DPI, so each trail point is shown for one frame on the
+cursor's current monitor before disappearing. The trail length depends on how far the cursor moved
+during that time.
 
-While running, it passively monitors DWM's actual frame timing on the primary monitor: when frame
-time deviates from the startup baseline (for example, video playback triggering VRR or DWM frame
-drops), it hides the trail and pauses commits until timing returns to the baseline.
+Multi-monitor & dynamic topology: only a single overlay window is maintained system-wide, following
+the cursor's current monitor (keeping non-active monitors free of topmost overlays so video playback
+keeps hardware planes/MPO). Mixed resolutions, refresh rates, and per-monitor DPI scaling are
+supported, and monitor hot-plugging or display/DPI/refresh-rate changes adapt automatically without
+restarting.
+
+While running, it passively monitors DWM's actual frame timing **independently for each monitor**
+via DirectComposition frame statistics: when a monitor deviates from its own baseline (for example,
+video playback triggering VRR or sustained DWM frame drops), the overlay pauses and hides on that
+monitor without affecting other monitors, and resumes automatically once timing stabilizes.
 
 ## Build
 
@@ -39,8 +46,10 @@ Quit with `Ctrl+Alt+Q` (exits immediately if the hotkey is already in use; singl
 
 ## Known limitations
 
-- **Primary monitor only**; nothing is drawn on other monitors. A change in resolution, refresh
-  rate, display scaling, or the number of monitors requires a restart.
+- **Crossing a monitor boundary clears the previous monitor's remaining trail.** To avoid keeping
+  multiple full-screen topmost windows that can degrade video composition, the app moves a single
+  overlay window to the cursor's current monitor, dropping the remaining sub-frame tail on the
+  previous monitor when crossing over.
 - **At most 64 trail points at once.** With a high-polling-rate mouse on a lower refresh rate, the
   oldest points may be dropped early; if the trail looks shorter than the cursor's actual movement,
   raise `--sprites`.
