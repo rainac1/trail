@@ -58,9 +58,13 @@ class FrameGuard {
 
  private:
   static constexpr uint32_t kCommitRingCapacity = 64;
+  static constexpr uint32_t kActiveWindowCapacity = 20;
 
   bool HasPendingCommitDropped(uint64_t prevStart, uint64_t currStart);
   void PurgeCommitsBefore(uint64_t cutoffQpc);
+  void ResetActiveWindow();
+  void RecordActiveInterval(uint64_t dtTicks);
+  bool ActiveFpsDeviatedOver10Pct() const;
   void EnterPaused(const wchar_t* reason, uint64_t eventTime, double measMs, double vblankMs,
                    uint32_t dRef);
   void EnterActive(uint64_t eventTime, double measMs, double vblankMs);
@@ -68,12 +72,13 @@ class FrameGuard {
   wchar_t tag_[32]{};
   uint64_t qpcFreq_ = 0;
   uint64_t baselineTicks_ = 0;
-  uint64_t tolVblankMildTicks_ = 0;    // vblank 轻微偏慢容差：max(12% * T_base, 0.60ms)
+  uint64_t tolFps10Ticks_ = 0;         // 帧率下降 10% 对应的周期增量：T_base / 9（≈ +11.11% * T_base）
+  uint64_t tolVblankMildTicks_ = 0;    // vblank 轻微偏慢容差：max(T_base / 9, 0.60ms)（不高于 10% 帧率偏离不判卡顿）
   uint64_t tolSevereTicks_ = 0;        // 严重偏慢阈值（+2 分，仍需多帧确认）：max(25% * T_base, 1.50ms)
-  uint64_t tolActiveRateTicks_ = 0;    // Active 跨帧持续偏慢容差：max(3% * T_base, 0.15ms)
+  uint64_t tolActiveRateTicks_ = 0;    // Active 跨帧持续偏慢容差：max(T_base / 9, 0.15ms)（10% 帧率容忍底线）
   uint64_t tolActiveJitterTicks_ = 0;  // Active 端点抖动摊薄项（除以 dRef）：max(10% * T_base, 0.50ms)
-  uint64_t tolResumeSingleTicks_ = 0;  // Paused 恢复单帧偏慢容差：max(6% * T_base, 0.35ms)
-  uint64_t tolResumeMultiTicks_ = 0;   // Paused 恢复跨帧均长容差：max(1% * T_base, 0.08ms)
+  uint64_t tolResumeSingleTicks_ = 0;  // Paused 恢复单帧偏慢容差：max(T_base / 9, 0.35ms)
+  uint64_t tolResumeMultiTicks_ = 0;   // Paused 恢复跨帧均长容差：max(9% * T_base, 0.08ms)（相对 10% 留回滞）
   uint64_t tolResumeJitterTicks_ = 0;  // Paused 恢复跨帧端点抖动摊薄项：max(2% * T_base, 0.16ms)
 
   CompletedFrame prevFrame_{};
@@ -83,6 +88,13 @@ class FrameGuard {
   uint64_t commitRing_[kCommitRingCapacity]{};
   uint32_t commitHead_ = 0;
   uint32_t commitCount_ = 0;
+
+  // 活跃呈现窗口（最近最多 kActiveWindowCapacity 个有效帧的 dt），用于判断掉帧是否导致
+  // 有效帧率偏离基准超过 10%（未超过 10% 不视为卡顿）。
+  uint64_t activeDtRing_[kActiveWindowCapacity]{};
+  uint32_t activeDtHead_ = 0;
+  uint32_t activeDtCount_ = 0;
+  uint64_t activeDtSum_ = 0;
 
   // 双态机状态（需多帧持续偏离才暂停，区分时序/VRR 与 DWM 掉帧，带指数退避恢复）
   bool paused_ = false;

@@ -211,6 +211,7 @@ bool FrameGuard::Initialize(uint64_t qpcFreq, const wchar_t* tag, uint64_t nomin
   hasPrevFrame_ = false;
   commitHead_ = 0;
   commitCount_ = 0;
+  ResetActiveWindow();
   lastMeasuredMs_ = 0.0;
   pauseCount_ = 0;
 
@@ -230,13 +231,13 @@ bool FrameGuard::Initialize(uint64_t qpcFreq, const wchar_t* tag, uint64_t nomin
     baselineTicks_ = qpcFreq_ / 60ULL;
   }
 
-  // 单侧偏慢检测 + 按 dRef 摊薄端点抖动：
-  //   - VRR/DRR 只会拉长帧周期，不会让显示器快于标称刷新率；短于 T_base 的单帧毛刺
-  //     通常是 completedTime/refreshCount 相位错位或前一帧延迟后的补偿，不计入异常。
-  //   - Active 态容忍偶发 1 帧抖动与小幅桌面波动：
-  //       * vblank 轻微偏慢：+12%（至少 0.60ms），严重偏慢：+25%（至少 1.50ms）；
-  //       * 周期均长容差：rate(+3%, >=0.15ms) + jitter(+10%, >=0.50ms)/dRef。
-  //   - Paused 恢复态仍保持较严的跨帧均长门槛，避免在 VRR 视频播放中途误恢复。
+  // 单侧偏慢检测 + 10% 帧率偏离容忍底线 + 按 dRef 摊薄端点抖动：
+  //   - 帧率未低于基准的 90%（即 F >= 0.90 * F_base <=> T <= 10/9 * T_base <=> 周期增量 <= T_base / 9
+  //     ≈ +11.11%）均视为正常波动，不判为 VRR 降频或卡顿。
+  //   - Active 态：
+  //       * vblank 轻微偏慢：max(T_base / 9, 0.60ms)，严重偏慢：max(25% * T_base, 1.50ms)；
+  //       * 周期均长容差：rate(max(T_base / 9, 0.15ms)) + jitter(max(10% * T_base, 0.50ms)) / dRef。
+  //   - Paused 恢复态相对 10% 留轻微回滞（跨帧均长 +9% ≈ 帧率恢复到基准 91.7% 以上），避免在临界点抖动。
   const uint64_t minVblankMild = std::max<uint64_t>(1, qpcFreq_ * 6ULL / 10000ULL);      // 0.60 ms
   const uint64_t minSevere = std::max<uint64_t>(1, qpcFreq_ * 15ULL / 10000ULL);         // 1.50 ms
   const uint64_t minActiveRate = std::max<uint64_t>(1, qpcFreq_ * 15ULL / 100000ULL);    // 0.15 ms
@@ -245,12 +246,13 @@ bool FrameGuard::Initialize(uint64_t qpcFreq, const wchar_t* tag, uint64_t nomin
   const uint64_t minResumeMulti = std::max<uint64_t>(1, qpcFreq_ * 8ULL / 100000ULL);    // 0.08 ms
   const uint64_t minResumeJitter = std::max<uint64_t>(1, qpcFreq_ * 16ULL / 100000ULL);  // 0.16 ms
 
-  tolVblankMildTicks_ = std::max(baselineTicks_ * 12ULL / 100ULL, minVblankMild);
+  tolFps10Ticks_ = baselineTicks_ / 9ULL;
+  tolVblankMildTicks_ = std::max(tolFps10Ticks_, minVblankMild);
   tolSevereTicks_ = std::max(baselineTicks_ * 25ULL / 100ULL, minSevere);
-  tolActiveRateTicks_ = std::max(baselineTicks_ * 3ULL / 100ULL, minActiveRate);
+  tolActiveRateTicks_ = std::max(tolFps10Ticks_, minActiveRate);
   tolActiveJitterTicks_ = std::max(baselineTicks_ * 10ULL / 100ULL, minActiveJitter);
-  tolResumeSingleTicks_ = std::max(baselineTicks_ * 6ULL / 100ULL, minResumeSingle);
-  tolResumeMultiTicks_ = std::max(baselineTicks_ / 100ULL, minResumeMulti);
+  tolResumeSingleTicks_ = std::max(tolFps10Ticks_, minResumeSingle);
+  tolResumeMultiTicks_ = std::max(baselineTicks_ * 9ULL / 100ULL, minResumeMulti);
   tolResumeJitterTicks_ = std::max(baselineTicks_ * 2ULL / 100ULL, minResumeJitter);
   return true;
 }
@@ -259,6 +261,7 @@ void FrameGuard::ResetSession() {
   hasPrevFrame_ = false;
   commitHead_ = 0;
   commitCount_ = 0;
+  ResetActiveWindow();
   timingBadScore_ = 0;
   timingCleanStreak_ = 0;
   dropBadScore_ = 0;
@@ -278,6 +281,7 @@ void FrameGuard::ResetFrameAnchor() {
   hasPrevFrame_ = false;
   commitHead_ = 0;
   commitCount_ = 0;
+  ResetActiveWindow();
 }
 
 void FrameGuard::SeedPrevFrame(const CompletedFrame& frame) {
@@ -302,6 +306,31 @@ void FrameGuard::PurgeCommitsBefore(uint64_t cutoffQpc) {
     commitHead_ = (commitHead_ + 1) % kCommitRingCapacity;
     --commitCount_;
   }
+}
+
+void FrameGuard::ResetActiveWindow() {
+  activeDtHead_ = 0;
+  activeDtCount_ = 0;
+  activeDtSum_ = 0;
+}
+
+void FrameGuard::RecordActiveInterval(uint64_t dtTicks) {
+  if (activeDtCount_ < kActiveWindowCapacity) {
+    activeDtRing_[(activeDtHead_ + activeDtCount_) % kActiveWindowCapacity] = dtTicks;
+    ++activeDtCount_;
+    activeDtSum_ += dtTicks;
+  } else {
+    activeDtSum_ -= activeDtRing_[activeDtHead_];
+    activeDtRing_[activeDtHead_] = dtTicks;
+    activeDtSum_ += dtTicks;
+    activeDtHead_ = (activeDtHead_ + 1) % kActiveWindowCapacity;
+  }
+}
+
+bool FrameGuard::ActiveFpsDeviatedOver10Pct() const {
+  if (activeDtCount_ == 0 || baselineTicks_ == 0) return false;
+  // 有效帧率 F_eff = count / sum(dt) < 0.90 * F_base  <=>  9 * sum(dt) > 10 * count * T_base
+  return activeDtSum_ * 9ULL > static_cast<uint64_t>(activeDtCount_) * baselineTicks_ * 10ULL;
 }
 
 bool FrameGuard::HasPendingCommitDropped(uint64_t prevStart, uint64_t currStart) {
@@ -339,6 +368,7 @@ void FrameGuard::EnterPaused(const wchar_t* reason, uint64_t eventTime, double m
   goodRefreshes_ = 0;
   commitHead_ = 0;
   commitCount_ = 0;
+  ResetActiveWindow();
   ++pauseCount_;
   DiagLog(L"[guard][%ls] paused (reason=%ls, meas=%.3f ms, vblank=%.3f ms, dRef=%u, base=%.3f ms, "
           L"holdoff=%.1fs)",
@@ -400,6 +430,12 @@ bool FrameGuard::OnFrameSample(const CompletedFrame& curr) {
   lastMeasuredMs_ = measMs;
 
   if (!paused_) {
+    if (dRef == 1 || commitDrop) {
+      RecordActiveInterval(dt);
+    } else if (dRef >= kCleanIdleResetRefs) {
+      ResetActiveWindow();
+    }
+
     const uint64_t activePeriodTol = tolActiveRateTicks_ + tolActiveJitterTicks_ / dRef;
     const bool vblankMild = (vblankOver > tolVblankMildTicks_);
     const bool periodMild = (periodOver > activePeriodTol);
@@ -432,7 +468,8 @@ bool FrameGuard::OnFrameSample(const CompletedFrame& curr) {
       dropCleanStreak_ = 0;
       const int weight = (dRef >= 3) ? 2 : 1;
       dropBadScore_ = std::min(dropBadScore_ + weight, kDropPauseThreshold);
-      if (dropBadScore_ >= kDropPauseThreshold) {
+      // 仅当活跃窗口内有效帧率偏离基准超过 10% 时才因掉帧暂停，零星偶发跳帧不算卡顿。
+      if (dropBadScore_ >= kDropPauseThreshold && ActiveFpsDeviatedOver10Pct()) {
         EnterPaused(L"drop", curr.completedTime, measMs, vblankMs, dRef);
         return true;
       }
