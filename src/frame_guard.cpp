@@ -102,7 +102,20 @@ struct DisplayPathEntry {
   wchar_t gdiDeviceName[CCHDEVICENAME]{};
   FrameGuard::TargetId target{};
   uint64_t nominalPeriodTicks = 0;
+  bool advancedColor = false;
 };
+
+// 查询显示目标是否处于高级色彩模式（HDR 或 Windows 11 自动色彩管理 ACM）。
+// 开启时 DWM 内部使用 FP16 线性 scRGB 合成，混合天然处于线性光空间。
+bool QueryTargetAdvancedColor(LUID adapterId, UINT32 targetId) {
+  DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO info{};
+  info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+  info.header.size = sizeof(info);
+  info.header.adapterId = adapterId;
+  info.header.id = targetId;
+  if (DisplayConfigGetDeviceInfo(&info.header) != ERROR_SUCCESS) return false;
+  return (info.advancedColorEnabled != 0) || (info.wideColorEnforced != 0);
+}
 
 std::vector<DisplayPathEntry> QueryActiveDisplayPaths(uint64_t qpcFreq) {
   std::vector<DisplayPathEntry> result;
@@ -135,6 +148,7 @@ std::vector<DisplayPathEntry> QueryActiveDisplayPaths(uint64_t qpcFreq) {
       entry.target.vidPnSourceId = p.sourceInfo.id;
       entry.target.vidPnTargetId = p.targetInfo.id;
       entry.target.valid = true;
+      entry.advancedColor = QueryTargetAdvancedColor(p.targetInfo.adapterId, p.targetInfo.id);
 
       const DISPLAYCONFIG_RATIONAL& r = p.targetInfo.refreshRate;
       if (r.Numerator > 0 && r.Denominator > 0) {
@@ -491,6 +505,7 @@ bool DisplayGuardManager::RefreshTopology() {
       if (_wcsicmp(entry.gdiDeviceName, snap.deviceName) == 0) {
         slot.desc.target = entry.target;
         slot.desc.nominalPeriodTicks = entry.nominalPeriodTicks;
+        slot.desc.advancedColor = entry.advancedColor;
         break;
       }
     }
@@ -556,13 +571,14 @@ bool DisplayGuardManager::RefreshTopology() {
         (slot.desc.nominalPeriodTicks > 0)
             ? (static_cast<double>(qpcFreq_) / static_cast<double>(slot.desc.nominalPeriodTicks))
             : 0.0;
-    DiagLog(L"[guard][%ls] #%zu %ls %d,%d %dx%d dpi=%u | baseline=%.3f ms (%.2f Hz, nominal=%.2f Hz, "
-            L"target=src%u/tgt%u%ls)",
+    DiagLog(L"[guard][%ls] #%zu %ls %d,%d %dx%d dpi=%u color=%ls | baseline=%.3f ms (%.2f Hz, "
+            L"nominal=%.2f Hz, target=src%u/tgt%u%ls)",
             tag, i, slot.desc.primary ? L"primary" : L"secondary",
             static_cast<int>(slot.desc.rect.left), static_cast<int>(slot.desc.rect.top),
             static_cast<int>(slot.desc.rect.right - slot.desc.rect.left),
-            static_cast<int>(slot.desc.rect.bottom - slot.desc.rect.top), slot.desc.dpi, baseMs,
-            baseHz, nomHz, slot.desc.target.vidPnSourceId, slot.desc.target.vidPnTargetId,
+            static_cast<int>(slot.desc.rect.bottom - slot.desc.rect.top), slot.desc.dpi,
+            slot.desc.advancedColor ? L"linear(HDR/ACM)" : L"sRGB(SDR)", baseMs, baseHz, nomHz,
+            slot.desc.target.vidPnSourceId, slot.desc.target.vidPnTargetId,
             slot.desc.target.valid ? L"" : L"(unmatched)");
   }
   return !monitors_.empty();
@@ -576,6 +592,11 @@ bool DisplayGuardManager::TopologyChanged() const {
     const MonitorSnapshot& s = snaps[i];
     if (cur.hmon != s.hmon || cur.dpi != s.dpi || cur.primary != s.primary ||
         !SameRect(cur.rect, s.rect) || _wcsicmp(cur.deviceName, s.deviceName) != 0) {
+      return true;
+    }
+    if (cur.target.valid &&
+        QueryTargetAdvancedColor(cur.target.adapterLuid, cur.target.vidPnTargetId) !=
+            cur.advancedColor) {
       return true;
     }
   }

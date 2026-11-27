@@ -58,7 +58,7 @@ bool BuildFromMonoMask(HBITMAP mask, CursorBitmap& out) {
       // AND=0,XOR=0 -> 黑；AND=0,XOR=1 -> 白；AND=1,XOR=1 -> 反色（如工字光标），
       // 叠加层不支持 XOR 混合，用中灰保证在深/浅背景上均可见。
       const uint8_t v = andBit ? 128 : (xorBit ? 255 : 0);
-      p[0] = p[1] = p[2] = v;  // 已预乘（alpha=255）
+      p[0] = p[1] = p[2] = v;  // alpha=255 时 straight 与 premultiplied 相同
       p[3] = 255;
     }
   }
@@ -92,7 +92,7 @@ bool ApplyAndMaskAlpha(HBITMAP mask, int w, int h, std::vector<uint8_t>& pixels)
   return true;
 }
 
-// 抓取 hCursor 的像素到 out（premultiplied BGRA）。宽高写入 out.width/out.height。
+// 抓取 hCursor 的像素到 out（straight alpha sRGB BGRA）。宽高写入 out.width/out.height。
 bool FetchCursorPixels(HCURSOR hCursor, CursorBitmap& out) {
   HICON icon = CopyIcon(hCursor);
   if (!icon) return false;
@@ -137,13 +137,11 @@ bool FetchCursorPixels(HCURSOR hCursor, CursorBitmap& out) {
             }
           }
           if (hasAlpha) {
-            // 32bpp DIB 字节序为 B,G,R,A。把 straight alpha 预乘为 premultiplied。
+            // 32bpp DIB 字节序为 B,G,R,A（straight alpha）。保留直通通道，仅清理全透明像素，
+            // 让渲染器在线性光空间完成缩放与分级预乘烘焙。
             for (size_t i = 0; i < pixelCount; ++i) {
               uint8_t* p = &out.pixels[i * 4];
-              const uint32_t a = p[3];
-              p[0] = static_cast<uint8_t>((static_cast<uint32_t>(p[0]) * a + 127) / 255);
-              p[1] = static_cast<uint8_t>((static_cast<uint32_t>(p[1]) * a + 127) / 255);
-              p[2] = static_cast<uint8_t>((static_cast<uint32_t>(p[2]) * a + 127) / 255);
+              if (p[3] == 0) p[0] = p[1] = p[2] = 0;
             }
             ok = true;
           } else if (ii.hbmMask) {

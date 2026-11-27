@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -129,9 +130,10 @@ void PrintUsage() {
   wprintf(
       L"Trail\n"
       L"Usage: trail.exe [options]\n"
-      L"  --sprites <n>      max concurrently visible sample sprites (default 64)\n"
-      L"  --log              write diagnostic log to trail.log next to trail.exe\n"
-      L"  --help             show this help\n"
+      L"  --sprites <n>         max concurrently visible sample sprites (default 64)\n"
+      L"  --opacity-base <val>  geometric opacity base per ctz level (default 1.618, 1 = uniform)\n"
+      L"  --log                 write diagnostic log to trail.log next to trail.exe\n"
+      L"  --help                show this help\n"
       L"Quit: Ctrl+Alt+Q\n");
 }
 
@@ -218,7 +220,8 @@ void SyncOverlayVisibility(bool shouldShow) {
 }
 
 // 用现有窗口重建渲染栈（启动初始化或设备丢失恢复）。
-bool InitRenderer(int maxSprites, const RECT& rect, UINT dpi, double trailMs) {
+bool InitRenderer(int maxSprites, const RECT& rect, UINT dpi, double trailMs, bool advancedColor,
+                  double opacityBase) {
   g_renderer.Shutdown();
 
   // 新的视觉树没有任何内容，旧的贴图/采样点位置全部作废。
@@ -230,7 +233,8 @@ bool InitRenderer(int maxSprites, const RECT& rect, UINT dpi, double trailMs) {
   g_lastCursorX = INT_MIN;
   g_lastCursorY = INT_MIN;
 
-  if (!g_renderer.Initialize(g_hwnd, rect, dpi, maxSprites, g_qpcFreq)) {
+  if (!g_renderer.Initialize(g_hwnd, rect, dpi, maxSprites, g_qpcFreq, advancedColor,
+                             opacityBase)) {
     return false;
   }
   g_renderer.SetTrailLifetimeMs(trailMs);
@@ -238,7 +242,7 @@ bool InitRenderer(int maxSprites, const RECT& rect, UINT dpi, double trailMs) {
 }
 
 // 启动路径：建窗口 -> 抢占退出热键 -> 建渲染栈 -> 最后才让窗口可见。
-CreateOverlayStatus CreateOverlay(int maxSprites) {
+CreateOverlayStatus CreateOverlay(int maxSprites, double opacityBase) {
   g_activeMonitor = PickInitialMonitor();
   const auto* slot = ActiveMonitorSlot();
   if (!slot) {
@@ -264,7 +268,8 @@ CreateOverlayStatus CreateOverlay(int maxSprites) {
     return CreateOverlayStatus::HotkeyBusy;
   }
 
-  if (!InitRenderer(maxSprites, g_windowRect, g_windowDpi, slot->guard.baselineMs())) {
+  if (!InitRenderer(maxSprites, g_windowRect, g_windowDpi, slot->guard.baselineMs(),
+                    slot->desc.advancedColor, opacityBase)) {
     UnregisterHotKey(g_hwnd, kQuitHotkeyId);
     g_tearingDownWindow = true;
     DestroyWindow(g_hwnd);
@@ -318,7 +323,8 @@ void SwitchActiveMonitor(int monIdx, bool forceGeometrySync) {
   if (g_renderer.ready()) {
     bool needCursorReupload = false;
     const OverlayRenderer::FrameResult fr = g_renderer.SetMonitorGeometry(
-        slot.desc.rect, slot.desc.dpi, slot.guard.baselineMs(), &needCursorReupload);
+        slot.desc.rect, slot.desc.dpi, slot.guard.baselineMs(), slot.desc.advancedColor,
+        &needCursorReupload);
     if (fr == OverlayRenderer::FrameResult::RecreateDevice) {
       g_deviceLost = true;
       return;
@@ -685,6 +691,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
 
   // ---- 命令行参数 ----
   int maxSprites = 64;
+  double opacityBase = OverlayRenderer::kDefaultOpacityBase;
   bool enableLog = false;
   for (int i = 1; i < __argc; ++i) {
     const wchar_t* a = __wargv[i];
@@ -695,12 +702,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     } else if (wcscmp(a, L"--sprites") == 0 && value) {
       maxSprites = static_cast<int>(wcstol(value, nullptr, 10));
       ++i;
+    } else if (wcscmp(a, L"--opacity-base") == 0 && value) {
+      wchar_t* end = nullptr;
+      const double parsed = wcstod(value, &end);
+      if (end != value && std::isfinite(parsed)) opacityBase = parsed;
+      ++i;
     } else if (wcscmp(a, L"--log") == 0) {
       enableLog = true;
     }
   }
   if (maxSprites < 1) maxSprites = 1;
   if (maxSprites > 512) maxSprites = 512;
+  if (opacityBase < 1.0) opacityBase = 1.0;
+  if (opacityBase > 100.0) opacityBase = 100.0;
 
   // ---- 单实例保护（在打开日志之前检查，避免干扰运行中实例）----
   HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, kInstanceMutex);
@@ -747,7 +761,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
     return cleanupExit(1);
   }
 
-  const CreateOverlayStatus status = CreateOverlay(maxSprites);
+  const CreateOverlayStatus status = CreateOverlay(maxSprites, opacityBase);
   if (status == CreateOverlayStatus::HotkeyBusy) {
     DiagFatal(L"Trail", L"退出热键 Ctrl+Alt+Q 已被其他程序占用，程序退出。");
     return cleanupExit(1);
@@ -758,8 +772,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
               L"可加 --log 参数记录具体失败步骤。");
     return cleanupExit(1);
   }
-  DiagLog(L"[main] renderer ready: monitors=%d, sprites=%d, input=WH_MOUSE_LL",
-          g_displayGuard.monitorCount(), maxSprites);
+  DiagLog(L"[main] renderer ready: monitors=%d, sprites=%d, opacity_base=%.3f, input=WH_MOUSE_LL",
+          g_displayGuard.monitorCount(), maxSprites, opacityBase);
 
   // 采样点到期 / 看门狗用的高分辨率定时器；创建失败时退回毫秒超时。
   g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -845,7 +859,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, PWSTR /*cmdLine*/,
         }
         const auto* slot = ActiveMonitorSlot();
         if (slot && InitRenderer(maxSprites, slot->desc.rect, slot->desc.dpi,
-                                 slot->guard.baselineMs())) {
+                                 slot->guard.baselineMs(), slot->desc.advancedColor, opacityBase)) {
           DiagLog(L"[recover] renderer rebuilt");
           g_windowRect = slot->desc.rect;
           g_windowDpi = slot->desc.dpi;

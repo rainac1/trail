@@ -113,6 +113,7 @@ class DisplayGuardManager {
     RECT rect{};
     UINT dpi = 96;
     bool primary = false;
+    bool advancedColor = false;  // 该屏已开启 HDR 或 Windows 11 ACM（DWM 在 FP16 线性 scRGB 空间合成）
     wchar_t deviceName[CCHDEVICENAME]{};
     FrameGuard::TargetId target{};
     uint64_t nominalPeriodTicks = 0;

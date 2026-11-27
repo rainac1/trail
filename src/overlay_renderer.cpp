@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #include "diag.h"
 
@@ -52,10 +55,43 @@ uint8_t ClampByte(double v) {
   return static_cast<uint8_t>(v + 0.5);
 }
 
-// 把光标位图缩放到指定像素尺寸。像素是预乘 alpha，所以对四个通道直接做面积平均即可
-// （放大时退化为双线性插值）。热点按同一比例缩放。
-void ScaleCursor(const CursorBitmap& src, int tw, int th, CursorBitmap& dst) {
-  dst = CursorBitmap{};
+// 尾随零计数，按约定 ctz(0) = -1。
+int CountTrailingZeros(uint32_t v) {
+  if (v == 0) return -1;
+#if defined(_MSC_VER)
+  unsigned long idx = 0;
+  _BitScanForward(&idx, v);
+  return static_cast<int>(idx);
+#else
+  return __builtin_ctz(v);
+#endif
+}
+
+// 标准 IEC 61966-2-1 sRGB EOTF / OETF（逆 gamma 与正 gamma）。
+double SrgbToLinear(double c) {
+  if (c <= 0.0) return 0.0;
+  if (c >= 1.0) return 1.0;
+  return (c <= 0.04045) ? (c / 12.92) : std::pow((c + 0.055) / 1.055, 2.4);
+}
+
+double LinearToSrgb(double l) {
+  if (l <= 0.0) return 0.0;
+  if (l >= 1.0) return 1.0;
+  return (l <= 0.0031308) ? (l * 12.92) : (1.055 * std::pow(l, 1.0 / 2.4) - 0.055);
+}
+
+// 线性光直通 BGRA 光标位图（每通道 [0, 1]，用于缩放与各亮度级别预烘焙）。
+struct LinearCursor {
+  int width = 0;
+  int height = 0;
+  int hotX = 0;
+  int hotY = 0;
+  std::vector<float> pixels;  // width*height*4，B_lin, G_lin, R_lin, A
+};
+
+// 将 straight sRGB 光标转入线性光空间，并按需在线性光预乘空间做面积平均缩放到 (tw, th)。
+void BuildLinearCursor(const CursorBitmap& src, int tw, int th, LinearCursor& dst) {
+  dst = LinearCursor{};
   if (tw <= 0 || th <= 0) return;
   dst.width = tw;
   dst.height = th;
@@ -65,10 +101,39 @@ void ScaleCursor(const CursorBitmap& src, int tw, int th, CursorBitmap& dst) {
   dst.hotY = (src.height > 0)
                  ? static_cast<int>(std::lround(static_cast<double>(src.hotY) * th / src.height))
                  : 0;
-  dst.pixels.assign(static_cast<size_t>(tw) * th * 4, 0);
+  dst.pixels.assign(static_cast<size_t>(tw) * th * 4, 0.0f);
   if (src.width <= 0 || src.height <= 0 ||
       src.pixels.size() < static_cast<size_t>(src.width) * src.height * 4) {
     return;
+  }
+
+  if (src.width == tw && src.height == th) {
+    const size_t n = static_cast<size_t>(tw) * th;
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t* p = &src.pixels[i * 4];
+      const double a = static_cast<double>(p[3]) / 255.0;
+      if (a <= 0.0) continue;
+      float* q = &dst.pixels[i * 4];
+      q[0] = static_cast<float>(SrgbToLinear(static_cast<double>(p[0]) / 255.0));
+      q[1] = static_cast<float>(SrgbToLinear(static_cast<double>(p[1]) / 255.0));
+      q[2] = static_cast<float>(SrgbToLinear(static_cast<double>(p[2]) / 255.0));
+      q[3] = static_cast<float>(a);
+    }
+    return;
+  }
+
+  // 先把源图一次性转成线性预乘，避免在缩放核内层循环重复调用 pow。
+  const size_t srcCount = static_cast<size_t>(src.width) * src.height;
+  std::vector<float> srcPremul(srcCount * 4, 0.0f);
+  for (size_t i = 0; i < srcCount; ++i) {
+    const uint8_t* p = &src.pixels[i * 4];
+    const double a = static_cast<double>(p[3]) / 255.0;
+    if (a <= 0.0) continue;
+    float* q = &srcPremul[i * 4];
+    q[0] = static_cast<float>(SrgbToLinear(static_cast<double>(p[0]) / 255.0) * a);
+    q[1] = static_cast<float>(SrgbToLinear(static_cast<double>(p[1]) / 255.0) * a);
+    q[2] = static_cast<float>(SrgbToLinear(static_cast<double>(p[2]) / 255.0) * a);
+    q[3] = static_cast<float>(a);
   }
 
   const double sx = static_cast<double>(src.width) / tw;
@@ -93,34 +158,118 @@ void ScaleCursor(const CursorBitmap& src, int tw, int th, CursorBitmap& dst) {
               std::min(x1, static_cast<double>(xx + 1)) - std::max(x0, static_cast<double>(xx));
           if (wx <= 0.0) continue;
           const double w = wx * wy;
-          const uint8_t* p = &src.pixels[(static_cast<size_t>(yy) * src.width + xx) * 4];
-          b += p[0] * w;
-          g += p[1] * w;
-          r += p[2] * w;
-          a += p[3] * w;
+          const float* p = &srcPremul[(static_cast<size_t>(yy) * src.width + xx) * 4];
+          b += static_cast<double>(p[0]) * w;
+          g += static_cast<double>(p[1]) * w;
+          r += static_cast<double>(p[2]) * w;
+          a += static_cast<double>(p[3]) * w;
           wsum += w;
         }
       }
-      uint8_t* q = &dst.pixels[(static_cast<size_t>(y) * tw + x) * 4];
       if (wsum > 0.0) {
-        q[0] = ClampByte(b / wsum);
-        q[1] = ClampByte(g / wsum);
-        q[2] = ClampByte(r / wsum);
-        q[3] = ClampByte(a / wsum);
+        const double aOut = std::clamp(a / wsum, 0.0, 1.0);
+        if (aOut > 1e-6) {
+          float* q = &dst.pixels[(static_cast<size_t>(y) * tw + x) * 4];
+          q[0] = static_cast<float>(std::clamp((b / wsum) / aOut, 0.0, 1.0));
+          q[1] = static_cast<float>(std::clamp((g / wsum) / aOut, 0.0, 1.0));
+          q[2] = static_cast<float>(std::clamp((r / wsum) / aOut, 0.0, 1.0));
+          q[3] = static_cast<float>(aOut);
+        }
       }
     }
+  }
+}
+
+// 从线性光直通光标烘焙一张 premultiplied BGRA 贴图。
+//   - advancedColor == true（HDR/ACM）：DWM 本身在 FP16 线性 scRGB 空间混合，直接编码为标准
+//     sRGB 预乘贴图（由 visual SetOpacity 在线性空间施加 alphaLevel，避免双重补偿）。
+//   - advancedColor == false（普通 SDR）：DWM 在非线性 sRGB 缓冲做仿射混合
+//     C_out = C_premul + (1 - A_eff) * B，此处对每个像素做黑白双端点精确线性光补偿：
+//       C0 = LinearToSrgb(a * F_lin)           （黑背景 B=0 严格精确）
+//       C1 = LinearToSrgb(a * F_lin + 1 - a)   （白背景 B=1 严格精确）
+//       C_premul = C0，A_eff = 1 - luma(C1 - C0)
+//     纯黑描边在任意背景 B 上严格精确，纯白主体在黑/白背景严格精确。
+void BakeLevelPixels(const LinearCursor& src, double alphaLevel, bool advancedColor,
+                     std::vector<uint8_t>& out) {
+  const size_t n = static_cast<size_t>(src.width) * src.height;
+  out.assign(n * 4, 0);
+
+  if (advancedColor) {
+    for (size_t i = 0; i < n; ++i) {
+      const float* p = &src.pixels[i * 4];
+      const double a = std::clamp(static_cast<double>(p[3]) * alphaLevel, 0.0, 1.0);
+      if (a <= 0.0) continue;
+      const uint8_t aByte = ClampByte(a * 255.0);
+      if (aByte == 0) continue;
+      uint8_t* q = &out[i * 4];
+      q[0] = std::min(aByte, ClampByte(LinearToSrgb(p[0]) * a * 255.0));
+      q[1] = std::min(aByte, ClampByte(LinearToSrgb(p[1]) * a * 255.0));
+      q[2] = std::min(aByte, ClampByte(LinearToSrgb(p[2]) * a * 255.0));
+      q[3] = aByte;
+    }
+    return;
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    const float* p = &src.pixels[i * 4];
+    const double a = std::clamp(static_cast<double>(p[3]) * alphaLevel, 0.0, 1.0);
+    if (a <= 0.0) continue;
+
+    const double b0 = LinearToSrgb(a * static_cast<double>(p[0]));
+    const double g0 = LinearToSrgb(a * static_cast<double>(p[1]));
+    const double r0 = LinearToSrgb(a * static_cast<double>(p[2]));
+
+    const double b1 = LinearToSrgb(a * static_cast<double>(p[0]) + (1.0 - a));
+    const double g1 = LinearToSrgb(a * static_cast<double>(p[1]) + (1.0 - a));
+    const double r1 = LinearToSrgb(a * static_cast<double>(p[2]) + (1.0 - a));
+
+    const double trans = 0.0722 * (b1 - b0) + 0.7152 * (g1 - g0) + 0.2126 * (r1 - r0);
+    double aEff = std::clamp(1.0 - trans, 0.0, 1.0);
+    // 保证 premultiplied alpha 不变量 C_premul[c] <= A_eff（饱和彩色光标也安全）。
+    aEff = std::clamp(std::max({aEff, b0, g0, r0}), 0.0, 1.0);
+
+    const uint8_t aByte = ClampByte(aEff * 255.0);
+    if (aByte == 0) continue;
+    uint8_t* q = &out[i * 4];
+    q[0] = std::min(aByte, ClampByte(b0 * 255.0));
+    q[1] = std::min(aByte, ClampByte(g0 * 255.0));
+    q[2] = std::min(aByte, ClampByte(r0 * 255.0));
+    q[3] = aByte;
   }
 }
 
 }  // namespace
 
 bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, int maxSprites,
-                                 uint64_t qpcFreq) {
+                                 uint64_t qpcFreq, bool advancedColor, double opacityBase) {
   Shutdown();  // 可直接用于重建：先释放上一次创建的全部对象
 
   if (!hwnd || maxSprites < 1 || qpcFreq == 0) return false;
   rect_ = windowRect;
   qpcFreq_ = qpcFreq;
+  advancedColor_ = advancedColor;
+  opacityBase_ = (std::isfinite(opacityBase) && opacityBase > 1.0)
+                     ? std::min(opacityBase, 100.0)
+                     : 1.0;
+
+  if (opacityBase_ <= 1.0 || maxSprites <= 1) {
+    levelCount_ = 1;
+    seqMask_ = 0;
+  } else {
+    uint32_t m = 1;
+    int bits = 0;
+    while (m < static_cast<uint32_t>(maxSprites)) {
+      m <<= 1;
+      ++bits;
+    }
+    seqMask_ = m - 1;
+    levelCount_ = bits + 1;
+  }
+  levelAlphas_.resize(static_cast<size_t>(levelCount_));
+  for (int l = 0; l < levelCount_; ++l) {
+    levelAlphas_[static_cast<size_t>(l)] =
+        (l == 0) ? 1.0f : static_cast<float>(std::pow(opacityBase_, -static_cast<double>(l)));
+  }
 
   const UINT effectiveDpi = dpi ? dpi : 96;
   spriteW_ = CursorMetricForDpi(SM_CXCURSOR, effectiveDpi);
@@ -153,7 +302,7 @@ bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, in
   }
 
   // 必须用 DCompositionCreateDevice3：基础版 DCompositionCreateDevice 创建出来的
-  // visual 只暴露 Visual 基接口，QI 不到 IDCompositionVisual3（SetVisible）。
+  // visual 只暴露 Visual 基接口，QI 不到 IDCompositionVisual3（SetVisible / SetOpacity）。
   hr = DCompositionCreateDevice3(dxgiDevice.Get(), IID_PPV_ARGS(&dcompDevice_));
   if (FAILED(hr)) {
     LogHr(L"DCompositionCreateDevice3", hr);
@@ -175,13 +324,10 @@ bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, in
     return fail();
   }
 
-  // 窗口 DPI 固定，光标目标像素尺寸不变：surface 只创建一次并绑定到全部 visual，
-  // 后续光标变形仅原位更新像素。
-  hr = dcompDevice_->CreateSurface(static_cast<UINT>(spriteW_), static_cast<UINT>(spriteH_),
-                                   DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED,
-                                   &spriteSurface_);
+  // 按总级别数一次性创建预烘焙 Surface 表（默认 64 槽仅 7 张 32x32 贴图，总计 ~28KB）。
+  hr = CreateLevelSurfaces(spriteW_, spriteH_, levelSurfaces_);
   if (FAILED(hr)) {
-    LogHr(L"CreateSurface(sprite)", hr);
+    LogHr(L"CreateSurface(levels)", hr);
     return fail();
   }
 
@@ -204,8 +350,12 @@ bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, in
       LogHr(L"visual->IDCompositionVisual3 QI", hr);
       return fail();
     }
-    slot.visual->SetContent(spriteSurface_.Get());
+    // 叶子节点显式设 MULTIPLY，确保 HDR/ACM 下使用 SetOpacity 不分配离屏中间层。
+    slot.visual->SetOpacityMode(DCOMPOSITION_OPACITY_MODE_MULTIPLY);
+    slot.visual->SetContent(levelSurfaces_[0].Get());
+    slot.visual->SetOpacity(1.0f);
     slot.visual->SetVisible(FALSE);
+    slot.level = 0;
     hr = root_->AddVisual(slot.visual.Get(), FALSE, nullptr);
     if (FAILED(hr)) {
       LogHr(L"AddVisual(sprite)", hr);
@@ -222,11 +372,14 @@ bool OverlayRenderer::Initialize(HWND hwnd, const RECT& windowRect, UINT dpi, in
 
   head_ = 0;
   live_ = 0;
+  seq_ = 0;
   hasCursorBitmap_ = false;
   loggedFailure_ = false;
   initialized_ = true;
-  DiagLog(L"[OverlayRenderer] initialized: %d sprite visuals (%dx%d), DirectComposition visual tree",
-          maxSprites, spriteW_, spriteH_);
+  DiagLog(L"[OverlayRenderer] initialized: %d sprite visuals (%dx%d), levels=%d base=%.3f "
+          L"color=%ls",
+          maxSprites, spriteW_, spriteH_, levelCount_, opacityBase_,
+          advancedColor_ ? L"linear(HDR/ACM)" : L"sRGB(SDR)");
   return true;
 }
 
@@ -237,19 +390,98 @@ void OverlayRenderer::Shutdown() {
   slots_.clear();
   root_.Reset();
   target_.Reset();
-  spriteSurface_.Reset();
+  levelSurfaces_.clear();
+  levelAlphas_.clear();
   dcompDevice_.Reset();
   d3dCtx_.Reset();
   d3dDevice_.Reset();
 
+  seqMask_ = 0;
+  seq_ = 0;
+  levelCount_ = 1;
   head_ = 0;
   live_ = 0;
   spriteW_ = 0;
   spriteH_ = 0;
   hotX_ = 0;
   hotY_ = 0;
+  advancedColor_ = false;
   hasCursorBitmap_ = false;
   initialized_ = false;
+}
+
+HRESULT OverlayRenderer::CreateLevelSurfaces(
+    int width, int height, std::vector<Microsoft::WRL::ComPtr<IDCompositionSurface>>& out) {
+  std::vector<Microsoft::WRL::ComPtr<IDCompositionSurface>> created;
+  created.reserve(static_cast<size_t>(levelCount_));
+  for (int l = 0; l < levelCount_; ++l) {
+    Microsoft::WRL::ComPtr<IDCompositionSurface> surf;
+    const HRESULT hr = dcompDevice_->CreateSurface(
+        static_cast<UINT>(width), static_cast<UINT>(height), DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_ALPHA_MODE_PREMULTIPLIED, &surf);
+    if (FAILED(hr)) return hr;
+    created.push_back(std::move(surf));
+  }
+  out = std::move(created);
+  return S_OK;
+}
+
+bool OverlayRenderer::UploadSurfacePixels(IDCompositionSurface* surface, const uint8_t* pixels,
+                                          int width, int height) {
+  POINT offset{0, 0};
+  Microsoft::WRL::ComPtr<IDXGISurface> dxgiSurface;
+  HRESULT hr = surface->BeginDraw(nullptr, IID_PPV_ARGS(&dxgiSurface), &offset);
+  if (FAILED(hr)) {
+    LogHr(L"surface BeginDraw", hr);
+    return false;
+  }
+
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> dst;
+  hr = dxgiSurface.As(&dst);
+  if (SUCCEEDED(hr)) {
+    const D3D11_BOX dstBox{
+        static_cast<UINT>(offset.x), static_cast<UINT>(offset.y), 0,
+        static_cast<UINT>(offset.x + width), static_cast<UINT>(offset.y + height), 1};
+    d3dCtx_->UpdateSubresource(dst.Get(), 0, &dstBox, pixels, static_cast<UINT>(width) * 4, 0);
+  }
+  const HRESULT endHr = surface->EndDraw();
+  if (FAILED(hr)) {
+    LogHr(L"upload sprite pixels", hr);
+    return false;
+  }
+  if (FAILED(endHr)) {
+    LogHr(L"surface EndDraw", endHr);
+    return false;
+  }
+  return true;
+}
+
+int OverlayRenderer::LevelForSeq(uint32_t seq) const {
+  if (levelCount_ <= 1) return 0;
+  const uint32_t k = seq & seqMask_;
+  const int level = CountTrailingZeros(k) + 1;  // ctz(0) = -1 -> 0 级
+  return std::clamp(level, 0, levelCount_ - 1);
+}
+
+void OverlayRenderer::ApplySlotLevel(Slot& slot, int level) {
+  level = std::clamp(level, 0, levelCount_ - 1);
+  if (slot.level == level) return;
+  if (advancedColor_) {
+    slot.visual->SetOpacity(levelAlphas_[static_cast<size_t>(level)]);
+  } else {
+    slot.visual->SetContent(levelSurfaces_[static_cast<size_t>(level)].Get());
+  }
+  slot.level = level;
+}
+
+void OverlayRenderer::ResetSlotBindings() {
+  if (levelSurfaces_.empty()) return;
+  IDCompositionSurface* baseSurface = levelSurfaces_[0].Get();
+  for (Slot& slot : slots_) {
+    slot.visual->SetContent(baseSurface);
+    slot.visual->SetOpacity(1.0f);
+    slot.level = 0;
+  }
 }
 
 bool OverlayRenderer::DeviceValid() {
@@ -272,6 +504,7 @@ void OverlayRenderer::SetTrailLifetimeMs(double ms) {
 
 OverlayRenderer::FrameResult OverlayRenderer::SetMonitorGeometry(const RECT& windowRect, UINT dpi,
                                                                  double trailMs,
+                                                                 bool advancedColor,
                                                                  bool* needCursorReupload) {
   if (needCursorReupload) *needCursorReupload = false;
   if (!initialized_ || !dcompDevice_) return FrameResult::RecreateDevice;
@@ -287,24 +520,30 @@ OverlayRenderer::FrameResult OverlayRenderer::SetMonitorGeometry(const RECT& win
   const int newH = CursorMetricForDpi(SM_CYCURSOR, effectiveDpi);
   if (newW <= 0 || newH <= 0) return FrameResult::Failed;
 
+  const bool colorChanged = (advancedColor != advancedColor_);
+  advancedColor_ = advancedColor;
+
   if (newW != spriteW_ || newH != spriteH_) {
-    Microsoft::WRL::ComPtr<IDCompositionSurface> newSurface;
-    const HRESULT hr = dcompDevice_->CreateSurface(
-        static_cast<UINT>(newW), static_cast<UINT>(newH), DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_ALPHA_MODE_PREMULTIPLIED, &newSurface);
+    std::vector<Microsoft::WRL::ComPtr<IDCompositionSurface>> newSurfaces;
+    const HRESULT hr = CreateLevelSurfaces(newW, newH, newSurfaces);
     if (FAILED(hr)) {
-      LogHr(L"CreateSurface(sprite resize)", hr);
+      LogHr(L"CreateSurface(levels resize)", hr);
       return IsDeviceLost(hr) ? FrameResult::RecreateDevice : FrameResult::Failed;
     }
 
-    spriteSurface_ = std::move(newSurface);
-    for (Slot& slot : slots_) {
-      slot.visual->SetContent(spriteSurface_.Get());
-    }
+    levelSurfaces_ = std::move(newSurfaces);
+    ResetSlotBindings();
     spriteW_ = newW;
     spriteH_ = newH;
     hotX_ = 0;
     hotY_ = 0;
+    hasCursorBitmap_ = false;
+    if (needCursorReupload) *needCursorReupload = true;
+    return CommitNow(nullptr);
+  }
+
+  if (colorChanged) {
+    ResetSlotBindings();
     hasCursorBitmap_ = false;
     if (needCursorReupload) *needCursorReupload = true;
     return CommitNow(nullptr);
@@ -321,46 +560,26 @@ void OverlayRenderer::LogFailureOnce(const wchar_t* step, HRESULT hr) {
 }
 
 bool OverlayRenderer::SetCursorBitmap(const CursorBitmap& bmp) {
-  if (!initialized_ || !dcompDevice_ || !spriteSurface_) return false;
+  if (!initialized_ || !dcompDevice_ || levelSurfaces_.empty()) return false;
   if (bmp.width <= 0 || bmp.height <= 0) return false;
 
-  CursorBitmap scaled;
-  const CursorBitmap* src = &bmp;
-  if (bmp.width != spriteW_ || bmp.height != spriteH_) {
-    ScaleCursor(bmp, spriteW_, spriteH_, scaled);
-    src = &scaled;
-  }
-  if (src->pixels.size() < static_cast<size_t>(src->width) * src->height * 4) return false;
+  LinearCursor linear;
+  BuildLinearCursor(bmp, spriteW_, spriteH_, linear);
+  if (linear.pixels.size() < static_cast<size_t>(linear.width) * linear.height * 4) return false;
 
-  POINT offset{0, 0};
-  Microsoft::WRL::ComPtr<IDXGISurface> dxgiSurface;
-  HRESULT hr = spriteSurface_->BeginDraw(nullptr, IID_PPV_ARGS(&dxgiSurface), &offset);
-  if (FAILED(hr)) {
-    LogHr(L"surface BeginDraw", hr);
-    return false;
-  }
-
-  Microsoft::WRL::ComPtr<ID3D11Texture2D> dst;
-  hr = dxgiSurface.As(&dst);
-  if (SUCCEEDED(hr)) {
-    const D3D11_BOX dstBox{
-        static_cast<UINT>(offset.x), static_cast<UINT>(offset.y), 0,
-        static_cast<UINT>(offset.x + src->width), static_cast<UINT>(offset.y + src->height), 1};
-    d3dCtx_->UpdateSubresource(dst.Get(), 0, &dstBox, src->pixels.data(),
-                               static_cast<UINT>(src->width) * 4, 0);
-  }
-  const HRESULT endHr = spriteSurface_->EndDraw();
-  if (FAILED(hr)) {
-    LogHr(L"upload sprite pixels", hr);
-    return false;
-  }
-  if (FAILED(endHr)) {
-    LogHr(L"surface EndDraw", endHr);
-    return false;
+  std::vector<uint8_t> baked;
+  const int uploadCount = advancedColor_ ? 1 : levelCount_;
+  for (int l = 0; l < uploadCount; ++l) {
+    const double alpha = advancedColor_ ? 1.0 : static_cast<double>(levelAlphas_[static_cast<size_t>(l)]);
+    BakeLevelPixels(linear, alpha, advancedColor_, baked);
+    if (!UploadSurfacePixels(levelSurfaces_[static_cast<size_t>(l)].Get(), baked.data(),
+                             linear.width, linear.height)) {
+      return false;
+    }
   }
 
-  hotX_ = src->hotX;
-  hotY_ = src->hotY;
+  hotX_ = linear.hotX;
+  hotY_ = linear.hotY;
   hasCursorBitmap_ = true;
 
   // 光标形状/热点已变：只隐藏当前活跃槽位，避免旧尾迹用新图形错位闪现。
@@ -377,6 +596,11 @@ OverlayRenderer::FrameResult OverlayRenderer::Update(const Sample* samples, uint
   const int n = static_cast<int>(slots_.size());
   bool dirty = false;
   lastCommitTicks_ = 0;
+
+  // 方案 B（零平移）：每个采样点按出生序号 seq 永久定级，仅保持队头（最新点）为 0 级、
+  // 把上一个队头降级回其永久级别；每来 1 个点最多改 2 个视觉节点。
+  const int oldNewest = (live_ > 0) ? ((head_ + live_ - 1) % n) : -1;
+  int lastInserted = -1;
 
   // ---- 新采样点写入 FIFO 环形队列：满时覆盖队头最老的槽位 ----
   for (uint32_t i = 0; i < count; ++i) {
@@ -404,16 +628,33 @@ OverlayRenderer::FrameResult OverlayRenderer::Update(const Sample* samples, uint
       head_ = (head_ + 1) % n;
     }
 
+    // 把前一个最新点定格到它的永久出生级别（批次内同一槽位最多更新一次）。
+    if (lastInserted >= 0 && lastInserted != idx) {
+      Slot& prev = slots_[static_cast<size_t>(lastInserted)];
+      ApplySlotLevel(prev, LevelForSeq(prev.seq));
+    } else if (lastInserted < 0 && oldNewest >= 0 && oldNewest != idx) {
+      Slot& prev = slots_[static_cast<size_t>(oldNewest)];
+      ApplySlotLevel(prev, LevelForSeq(prev.seq));
+    }
+
     Slot& slot = slots_[static_cast<size_t>(idx)];
     // offset 用窗口客户区坐标（窗口左上角 = rect_ 左上角）。
     slot.visual->SetOffsetX(static_cast<float>(samples[i].x - rect_.left - hotX_));
     slot.visual->SetOffsetY(static_cast<float>(samples[i].y - rect_.top - hotY_));
     slot.bornQpc = born;
+    slot.seq = seq_++;
+    lastInserted = idx;
     dirty = true;
   }
 
   // ---- 过期：从队头弹出时间窗之外的采样点 ----
   if (HideExpired(now)) dirty = true;
+
+  // 保证当前最新可见采样点为 0 级（不透明度 1.0）。
+  if (live_ > 0 && lastInserted >= 0) {
+    const int newest = (head_ + live_ - 1) % n;
+    ApplySlotLevel(slots_[static_cast<size_t>(newest)], 0);
+  }
 
   if (!dirty) return FrameResult::Ok;
   return CommitNow(committed);
@@ -453,20 +694,28 @@ bool OverlayRenderer::HideExpired(uint64_t now) {
     --live_;
     dirty = true;
   }
-  if (live_ == 0) head_ = 0;  // 停顿清空后从槽 0 重来，减少环形回绕的 Z 序反转
+  if (live_ == 0) {
+    head_ = 0;  // 停顿清空后从槽 0 与序号 0 重来，减少回绕并让新一笔从 0 级起步
+    seq_ = 0;
+  }
   return dirty;
 }
 
 void OverlayRenderer::HideVisibleSlots() {
-  if (live_ == 0) return;
+  if (live_ == 0) {
+    seq_ = 0;
+    return;
+  }
   const int n = static_cast<int>(slots_.size());
   for (int k = 0; k < live_; ++k) {
     Slot& slot = slots_[static_cast<size_t>((head_ + k) % n)];
     slot.visual->SetVisible(FALSE);
     slot.bornQpc = 0;
+    slot.seq = 0;
   }
   head_ = 0;
   live_ = 0;
+  seq_ = 0;
 }
 
 uint64_t OverlayRenderer::NextExpiryQpc() const {

@@ -40,6 +40,7 @@ build\trail.exe --sprites 96
 | Option | Meaning |
 |---|---|
 | `--sprites <n>` | max number of trail points shown at once (default 64) |
+| `--opacity-base <val>` | geometric base for trailing-zero graded opacity (`level = ctz(k) + 1`, linear opacity `1 / base^level`; default `1.618`, `1` for uniform opacity) |
 | `--log` | enable diagnostic logging to `trail.log` next to the executable (off by default) |
 
 Quit with `Ctrl+Alt+Q` (exits immediately if the hotkey is already in use; single-instance only).
